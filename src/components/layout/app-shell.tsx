@@ -5,6 +5,7 @@ import { Bell, Menu, Search, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Brand } from "@/components/layout/brand";
+import { DemoStorageNotice } from "@/components/layout/demo-storage-notice";
 import { SidebarFooter } from "@/components/layout/sidebar-footer";
 import { SidebarNav } from "@/components/layout/sidebar-nav";
 import { cn } from "@/lib/utils";
@@ -114,7 +115,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </header>
 
         <main className="flex-1 px-4 py-6 sm:px-6 lg:px-8">
-          <div className="mx-auto w-full max-w-7xl">{children}</div>
+          <div className="mx-auto w-full max-w-7xl">
+            <DemoStorageNotice />
+            {children}
+          </div>
         </main>
       </div>
     </div>
