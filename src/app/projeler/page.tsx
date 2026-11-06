@@ -1,8 +1,14 @@
 import type { Metadata } from "next";
-import { ModulePlaceholder } from "@/components/layout/module-placeholder";
+import { PageHeader } from "@/components/layout/page-header";
+import { ProjectList } from "@/components/projects/project-list";
 
 export const metadata: Metadata = { title: "Projeler" };
 
 export default function Page() {
-  return <ModulePlaceholder href="/projeler" />;
+  return (
+    <>
+      <PageHeader title="Projeler" description="Projeleri, talep yoğunluğunu ve kalite durumunu izleyin." />
+      <ProjectList />
+    </>
+  );
 }
