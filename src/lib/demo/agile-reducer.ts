@@ -7,6 +7,7 @@
  * - workItem/removeFromSprint  → sprintten çıkarma (backlog'a döner)
  * - workItem/setStatus         → Kanban durum değiştirme (yalnızca aktif sprintte)
  * - workItem/update / rank     → içerik düzenleme / backlog sıralama
+ * - workItem/delete            → işi silme (geçmişe ait işler silinemez)
  *
  * Kurallar:
  * - Tamamlanan sprintteki işler kilitlidir (geçmiş korunur): durum/sprint değişmez, puan/tür düzenlenmez.
@@ -75,6 +76,7 @@ export type AgileAction =
   | { type: "workItem/addToSprint"; meta: ActionMeta; workItemId: string; sprintId: string }
   | { type: "workItem/removeFromSprint"; meta: ActionMeta; workItemId: string }
   | { type: "workItem/setStatus"; meta: ActionMeta; workItemId: string; status: SprintBoardStatus }
+  | { type: "workItem/delete"; meta: ActionMeta; workItemId: string }
   | { type: "sprint/create"; meta: ActionMeta; input: NewSprintInput }
   | { type: "sprint/update"; meta: ActionMeta; sprintId: string; changes: SprintChanges }
   | { type: "sprint/start"; meta: ActionMeta; sprintId: string }
@@ -131,6 +133,30 @@ const sprintOf = (s: DemoState, item: WorkItem): Sprint | undefined =>
 
 /** Tamamlanan sprintteki işler kilitlidir. */
 const isLocked = (s: DemoState, item: WorkItem) => sprintOf(s, item)?.status === "Tamamlandı";
+
+/* --- Ekranların da kullandığı kural yardımcıları (tek kaynak) --- */
+
+/** İş tamamlanmış bir sprintte mi (geçmiş; puan/tür/sprint/durum değiştirilemez)? */
+export function isWorkItemLocked(s: DemoState, item: WorkItem): boolean {
+  return isLocked(s, item);
+}
+
+/** İş silinemiyorsa nedenini, silinebiliyorsa null döndürür. */
+export function workItemDeleteBlocker(s: DemoState, item: WorkItem): string | null {
+  if (isLocked(s, item)) return "Tamamlanmış bir sprintteki iş silinemez; sprint geçmişinin parçasıdır.";
+  const inHistory = s.sprints.find(
+    (sp) => sp.summary && (sp.summary.carriedOverItemIds.includes(item.id) || sp.summary.completedItems.some((c) => c.workItemId === item.id))
+  );
+  if (inHistory) return `${inHistory.code} sprintinin geçmiş özetinde yer aldığı için silinemez.`;
+  return null;
+}
+
+/** Sprint başlatılamıyorsa nedenini, başlatılabiliyorsa null döndürür. */
+export function sprintStartBlocker(s: DemoState, sprint: Sprint): string | null {
+  if (sprint.status !== "Planlandı") return "Yalnızca planlanan sprint başlatılabilir.";
+  const active = s.sprints.find((sp) => sp.projectId === sprint.projectId && sp.status === "Aktif");
+  return active ? `Projede zaten aktif bir sprint var (${active.code}).` : null;
+}
 
 const nextBacklogRank = (s: DemoState, projectId: string) =>
   s.workItems.filter((w) => w.projectId === projectId).reduce((max, w) => Math.max(max, w.rank), 0) + 1;
@@ -254,6 +280,13 @@ export function agileReducer(state: DemoState, action: AgileAction): DemoState {
         return next;
       });
 
+    case "workItem/delete": {
+      const item = state.workItems.find((w) => w.id === action.workItemId);
+      if (!item || workItemDeleteBlocker(state, item)) return state;
+      // "Hata" işi silinince yalnızca Defect bağı kalkar; Defect kaydı korunur.
+      return { ...state, workItems: state.workItems.filter((w) => w.id !== item.id) };
+    }
+
     case "workItem/rank": {
       const item = state.workItems.find((w) => w.id === action.workItemId);
       if (!item || item.sprintId !== null) return state;
@@ -342,8 +375,7 @@ export function agileReducer(state: DemoState, action: AgileAction): DemoState {
 
     case "sprint/start": {
       const sprint = state.sprints.find((sp) => sp.id === action.sprintId);
-      if (!sprint || sprint.status !== "Planlandı") return state;
-      if (state.sprints.some((sp) => sp.projectId === sprint.projectId && sp.status === "Aktif")) return state;
+      if (!sprint || sprintStartBlocker(state, sprint)) return state;
       return replaceSprint(state, sprint.id, (sp) => ({ ...sp, status: "Aktif" }));
     }
 

@@ -302,6 +302,11 @@ export const demoActions = {
     return dispatchChanged({ type: "workItem/removeFromSprint", meta: createMeta(), workItemId });
   },
 
+  /** İşi siler; geçmişe ait (tamamlanan sprint / sprint özeti) işler silinmez. Silindiyse true. */
+  deleteWorkItem(workItemId: string): boolean {
+    return dispatchChanged({ type: "workItem/delete", meta: createMeta(), workItemId });
+  },
+
   setWorkItemStatus(workItemId: string, status: SprintBoardStatus): boolean {
     return dispatchChanged({ type: "workItem/setStatus", meta: createMeta(), workItemId, status });
   },

@@ -4,7 +4,10 @@
  * - Tamamlanan sprintlerde puanlar değişmez özetten (summary) okunur; geçmiş korunur.
  * - Gün sınırları Europe/Istanbul saat dilimine göre belirlenir.
  */
-import { SPRINT_BOARD_STATUSES, type DemoState, type Sprint, type WorkItem } from "../domain/types";
+import { SPRINT_BOARD_STATUSES, type DemoState, type Sprint, type SprintStatus, type WorkItem } from "../domain/types";
+
+// Kural yardımcıları reducer ile aynı kaynaktan gelir (ekranlar kuralları yeniden yazmaz).
+export { isWorkItemLocked, sprintStartBlocker, workItemDeleteBlocker } from "./agile-reducer";
 
 const TIME_ZONE = "Europe/Istanbul";
 const dayFormatter = new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -37,6 +40,22 @@ export const getWorkItem = (s: DemoState, workItemId: string) => s.workItems.fin
 /** Projenin sprintleri, başlangıç tarihine göre. */
 export const getProjectSprints = (s: DemoState, projectId: string) =>
   s.sprints.filter((sp) => sp.projectId === projectId).sort((a, b) => a.startDate.localeCompare(b.startDate));
+
+/** Projenin belirli durumdaki sprintleri (tamamlananlar en yeniden eskiye). */
+export function getProjectSprintsByStatus(s: DemoState, projectId: string, status: SprintStatus) {
+  const list = getProjectSprints(s, projectId).filter((sp) => sp.status === status);
+  return status === "Tamamlandı" ? list.reverse() : list;
+}
+
+/** İşin eklenebileceği sprintler: aynı projede planlanan veya aktif. */
+export const getAssignableSprints = (s: DemoState, projectId: string) =>
+  getProjectSprints(s, projectId).filter((sp) => sp.status !== "Tamamlandı");
+
+/** Projeye ait gereksinimler (talep üzerinden). */
+export function getProjectRequirements(s: DemoState, projectId: string) {
+  const requestIds = new Set(s.requests.filter((r) => r.projectId === projectId).map((r) => r.id));
+  return s.requirements.filter((r) => requestIds.has(r.requestId));
+}
 
 export const getActiveSprint = (s: DemoState, projectId: string) =>
   s.sprints.find((sp) => sp.projectId === projectId && sp.status === "Aktif");

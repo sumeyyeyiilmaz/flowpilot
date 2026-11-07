@@ -3,6 +3,7 @@ import {
   FlaskConical,
   FolderKanban,
   Inbox,
+  Kanban,
   LayoutDashboard,
   ListChecks,
   Network,
@@ -34,6 +35,12 @@ export const mainNav: NavItem[] = [
     href: "/talepler",
     icon: Inbox,
     description: "Yeni iş taleplerini ve mevcut sistem değişikliklerini yönetin.",
+  },
+  {
+    title: "Sprintler",
+    href: "/sprintler",
+    icon: Kanban,
+    description: "Product Backlog ve sprint planlama.",
   },
   {
     title: "Gereksinimler",

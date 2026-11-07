@@ -1,4 +1,4 @@
-import { Lightbulb, Wrench } from "lucide-react";
+import { Bug, FlaskConical, Lightbulb, ListTodo, Telescope, Wrench, type LucideIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import {
   REQUEST_TYPE_LABELS,
@@ -9,6 +9,10 @@ import {
   type ProjectStatus,
   type RequestStatus,
   type RequestType,
+  type SprintStatus,
+  type StoryPoint,
+  type WorkItemStatus,
+  type WorkItemType,
 } from "@/lib/domain/types";
 import { cn } from "@/lib/utils";
 
@@ -106,6 +110,59 @@ export function RequestTypeBadge({ type, short = false }: { type: RequestType; s
     <Badge variant="outline" className="gap-1 bg-background" title={REQUEST_TYPE_LABELS[type]}>
       <Icon aria-hidden="true" className={type === "new" ? "text-indigo-500" : "text-amber-600"} />
       {label}
+    </Badge>
+  );
+}
+
+/* ---------------- Agile ---------------- */
+
+const workItemTypeStyle: Record<WorkItemType, { icon: LucideIcon; className: string }> = {
+  Story: { icon: FlaskConical, className: "text-indigo-500" },
+  Görev: { icon: ListTodo, className: "text-sky-600" },
+  Hata: { icon: Bug, className: "text-rose-600" },
+  Spike: { icon: Telescope, className: "text-violet-600" },
+};
+
+export function WorkItemTypeBadge({ type }: { type: WorkItemType }) {
+  const { icon: Icon, className } = workItemTypeStyle[type];
+  return (
+    <Badge variant="outline" className="gap-1 bg-background">
+      <Icon aria-hidden="true" className={className} />
+      {type}
+    </Badge>
+  );
+}
+
+const sprintStatusTone: Record<SprintStatus, keyof typeof tone> = {
+  Planlandı: "slate",
+  Aktif: "sky",
+  Tamamlandı: "emerald",
+};
+
+export function SprintStatusBadge({ status }: { status: SprintStatus }) {
+  return <Badge className={tone[sprintStatusTone[status]]}>{status}</Badge>;
+}
+
+const workItemStatusTone: Record<WorkItemStatus, keyof typeof tone> = {
+  Backlog: "slate",
+  Yapılacak: "slate",
+  "Devam Ediyor": "sky",
+  İncelemede: "violet",
+  Tamamlandı: "emerald",
+};
+
+export function WorkItemStatusBadge({ status }: { status: WorkItemStatus }) {
+  return <Badge className={tone[workItemStatusTone[status]]}>{status}</Badge>;
+}
+
+export function StoryPointBadge({ points }: { points: StoryPoint | null }) {
+  return (
+    <Badge
+      variant="outline"
+      className={cn("tabular-nums", points === null && "border-dashed text-muted-foreground")}
+      title={points === null ? "Story Point tahmini yok" : `${points} Story Point`}
+    >
+      {points === null ? "– SP" : `${points} SP`}
     </Badge>
   );
 }
