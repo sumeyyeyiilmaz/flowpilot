@@ -14,7 +14,7 @@
  * - Veritabanı, API veya harici servis kullanılmaz.
  */
 import { useSyncExternalStore } from "react";
-import type { AnalysisSection, DemoState, SectionKind } from "../domain/types";
+import type { AnalysisSection, DemoState, SectionKind, WorkItemStatus } from "../domain/types";
 import {
   demoReducer,
   normalizeDemoState,
@@ -27,6 +27,16 @@ import {
   type NewRequirementInput,
   type RequestChanges,
 } from "./reducer";
+import {
+  agileReducer,
+  isAgileAction,
+  type AgileAction,
+  type DailyScrumInput,
+  type NewSprintInput,
+  type NewWorkItemInput,
+  type SprintChanges,
+  type WorkItemChanges,
+} from "./agile-reducer";
 import { createSeedState } from "./seed";
 import {
   clearDemoStorage,
@@ -161,14 +171,23 @@ function createMeta(): ActionMeta {
   return { now: new Date().toISOString(), newId };
 }
 
-function dispatch(action: DemoAction) {
-  setClientState(demoReducer(getClientState(), action));
+/** Agile işlemleri agile reducer'a, diğerleri mevcut demo reducer'a yönlendirilir. */
+function dispatch(action: DemoAction | AgileAction) {
+  const current = getClientState();
+  setClientState(isAgileAction(action) ? agileReducer(current, action) : demoReducer(current, action));
+}
+
+/** İşlem state'i değiştirdiyse true döndürür (geçersiz işlem state'i değiştirmez). */
+function dispatchChanged(action: DemoAction | AgileAction): boolean {
+  const before = getClientState();
+  dispatch(action);
+  return getClientState() !== before;
 }
 
 /** Son eklenen kaydın kimliğini döndürmek için yardımcı. */
-function dispatchAndGetNewId<K extends "requests" | "analyses" | "requirements">(
+function dispatchAndGetNewId<K extends "requests" | "analyses" | "requirements" | "workItems" | "sprints">(
   collection: K,
-  action: DemoAction
+  action: DemoAction | AgileAction
 ): string | null {
   const before = getClientState()[collection].length;
   dispatch(action);
@@ -259,6 +278,57 @@ export const demoActions = {
     dispatch({ type: "requirement/update", meta: createMeta(), requirementId, changes });
     return getClientState() !== before;
   },
+
+  /* ---------------- Agile / Sprint ---------------- */
+
+  /** Product Backlog'a yeni iş alır; oluşan işin kimliğini döndürür (geçersizse null). */
+  createWorkItem(input: NewWorkItemInput): string | null {
+    return dispatchAndGetNewId("workItems", { type: "workItem/create", meta: createMeta(), input });
+  },
+
+  updateWorkItem(workItemId: string, changes: WorkItemChanges): boolean {
+    return dispatchChanged({ type: "workItem/update", meta: createMeta(), workItemId, changes });
+  },
+
+  rankWorkItem(workItemId: string, direction: "up" | "down"): boolean {
+    return dispatchChanged({ type: "workItem/rank", meta: createMeta(), workItemId, direction });
+  },
+
+  addWorkItemToSprint(workItemId: string, sprintId: string): boolean {
+    return dispatchChanged({ type: "workItem/addToSprint", meta: createMeta(), workItemId, sprintId });
+  },
+
+  removeWorkItemFromSprint(workItemId: string): boolean {
+    return dispatchChanged({ type: "workItem/removeFromSprint", meta: createMeta(), workItemId });
+  },
+
+  setWorkItemStatus(workItemId: string, status: WorkItemStatus): boolean {
+    return dispatchChanged({ type: "workItem/setStatus", meta: createMeta(), workItemId, status });
+  },
+
+  /** Yeni sprint oluşturur (Planlandı); oluşan sprintin kimliğini döndürür (geçersizse null). */
+  createSprint(input: NewSprintInput): string | null {
+    return dispatchAndGetNewId("sprints", { type: "sprint/create", meta: createMeta(), input });
+  },
+
+  updateSprint(sprintId: string, changes: SprintChanges): boolean {
+    return dispatchChanged({ type: "sprint/update", meta: createMeta(), sprintId, changes });
+  },
+
+  startSprint(sprintId: string): boolean {
+    return dispatchChanged({ type: "sprint/start", meta: createMeta(), sprintId });
+  },
+
+  completeSprint(sprintId: string): boolean {
+    return dispatchChanged({ type: "sprint/complete", meta: createMeta(), sprintId });
+  },
+
+  /** Daily Scrum kaydı ekler veya (sprint + kişi + tarih aynıysa) günceller. */
+  upsertDailyScrum(input: DailyScrumInput): boolean {
+    return dispatchChanged({ type: "daily/upsert", meta: createMeta(), input });
+  },
+
+  /* ---------------- Analiz temizliği ---------------- */
 
   /** Analizdeki boş başlık/madde ve boşlukları temizler (geçerli içerik korunur). */
   normalizeAnalysis(analysisId: string) {

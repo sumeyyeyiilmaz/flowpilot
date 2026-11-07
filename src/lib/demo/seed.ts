@@ -18,6 +18,7 @@ import {
   type TestRun,
   type WorkRequest,
 } from "../domain/types";
+import { createAgileSeed } from "./agile-seed";
 
 const projects: Project[] = [
   {
@@ -603,11 +604,8 @@ const SEED_STATE: DemoState = {
   testCases,
   testRuns,
   defects,
-  // Agile koleksiyonları (şema v2). Sentetik agile başlangıç verisi sonraki adımda eklenecek.
-  teamMembers: [],
-  workItems: [],
-  sprints: [],
-  dailyScrums: [],
+  // Agile koleksiyonları (şema v2).
+  ...createAgileSeed(),
 };
 
 /** Her çağrıda başlangıç verisinin bağımsız bir kopyasını döndürür. */

@@ -3,34 +3,42 @@
  *
  * v1 → v2: Agile koleksiyonları (teamMembers, workItems, sprints, dailyScrums) eklenir.
  * - Mevcut v1 kayıtlarının hiçbiri değiştirilmez, silinmez veya yeniden sıralanmaz.
- * - Eklenen koleksiyonların başlangıç değerleri sentetik başlangıç verisinden alınır.
  * - Geçiş sonrası v1 koleksiyonlarının birebir korunduğu doğrulanır; ardından sonuç v2
  *   kurallarıyla doğrulanır. Herhangi bir adım başarısız olursa geçiş reddedilir ve
  *   çağıran (tarayıcı depolaması) kurtarma moduna geçer; ham veri silinmez.
  * - Geçiş yalnızca bellekte yapılır; depolamaya ancak kullanıcının bir sonraki
- *   değişikliğinde yazılır.
+ *   değişikliğinde yazılır. (Geçiş öncesi yedek storage.ts'te alınır.)
+ *
+ * Agile başlangıç verisi: Dört Agile koleksiyonunun TAMAMI boşsa sentetik Agile başlangıç
+ * verisi eklenir. Herhangi biri doluysa hiçbirine otomatik veri eklenmez. Eklenen veri
+ * mevcut kayıtlarla doğrulanamazsa eklenmez (koleksiyonlar boş kalır, geçiş başarısız sayılmaz).
  */
 import { DEMO_SCHEMA_VERSION, type DemoState, type DemoStateV1 } from "../domain/types";
-import { createSeedState } from "./seed";
+import { createAgileSeed } from "./agile-seed";
 import { findDemoStateProblem, findDemoStateV1Problem } from "./validation";
 
 export type MigrationResult =
-  | { ok: true; state: DemoState; migratedFrom: number | null }
+  | { ok: true; state: DemoState; migratedFrom: number | null; agileSeeded: boolean }
   | { ok: false; problem: string };
 
 const V1_KEYS = ["projects", "requests", "analyses", "requirements", "testCases", "testRuns", "defects"] as const;
 
-/** v1 verisini v2'ye yükseltir. Girdi önceden v1 olarak doğrulanmış olmalıdır. */
+/** v1 verisini v2'ye yükseltir: v1 kayıtları aynen, Agile koleksiyonları boş. */
 export function migrateV1ToV2(v1: DemoStateV1): DemoState {
-  const seed = createSeedState();
-  return {
-    ...v1,
-    schemaVersion: 2,
-    teamMembers: seed.teamMembers,
-    workItems: seed.workItems,
-    sprints: seed.sprints,
-    dailyScrums: seed.dailyScrums,
-  };
+  return { ...v1, schemaVersion: 2, teamMembers: [], workItems: [], sprints: [], dailyScrums: [] };
+}
+
+const agileIsEmpty = (s: DemoState) =>
+  s.teamMembers.length === 0 && s.workItems.length === 0 && s.sprints.length === 0 && s.dailyScrums.length === 0;
+
+/**
+ * Dört Agile koleksiyonu da boşsa sentetik Agile başlangıç verisini ekler.
+ * Sonuç geçerli değilse (ör. başlangıç verisinin işaret ettiği kayıt yoksa) state'i değiştirmez.
+ */
+export function seedAgileIfEmpty(state: DemoState): { state: DemoState; seeded: boolean } {
+  if (!agileIsEmpty(state)) return { state, seeded: false };
+  const candidate: DemoState = { ...state, ...createAgileSeed() };
+  return findDemoStateProblem(candidate) === null ? { state: candidate, seeded: true } : { state, seeded: false };
 }
 
 /** Geçişin v1 kayıtlarını birebir koruduğunu doğrular. */
@@ -45,8 +53,9 @@ function findLossProblem(before: DemoStateV1, after: DemoState): string | null {
 
 /**
  * Okunan veriyi güncel şemaya getirir.
- * - Güncel şemadaysa yalnızca doğrular (`migratedFrom: null`).
+ * - Güncel şemadaysa doğrular (`migratedFrom: null`).
  * - v1 ise doğrular, geçirir, kayıpsızlığı ve sonucu doğrular (`migratedFrom: 1`).
+ * - Her iki durumda da Agile koleksiyonları tamamen boşsa başlangıç verisi eklenir (`agileSeeded`).
  * - Diğer her durumda okunabilir bir sorun açıklaması döndürür.
  */
 export function migrateToCurrent(value: unknown): MigrationResult {
@@ -54,7 +63,9 @@ export function migrateToCurrent(value: unknown): MigrationResult {
 
   if (version === DEMO_SCHEMA_VERSION) {
     const problem = findDemoStateProblem(value);
-    return problem ? { ok: false, problem } : { ok: true, state: value as DemoState, migratedFrom: null };
+    if (problem) return { ok: false, problem };
+    const seeded = seedAgileIfEmpty(value as DemoState);
+    return { ok: true, state: seeded.state, migratedFrom: null, agileSeeded: seeded.seeded };
   }
 
   if (version === 1) {
@@ -71,7 +82,8 @@ export function migrateToCurrent(value: unknown): MigrationResult {
     if (loss) return { ok: false, problem: loss };
     const v2Problem = findDemoStateProblem(migrated);
     if (v2Problem) return { ok: false, problem: `Şema v1 → v2 geçişi doğrulanamadı: ${v2Problem}` };
-    return { ok: true, state: migrated, migratedFrom: 1 };
+    const seeded = seedAgileIfEmpty(migrated);
+    return { ok: true, state: seeded.state, migratedFrom: 1, agileSeeded: seeded.seeded };
   }
 
   if (typeof value !== "object" || value === null || Array.isArray(value)) return { ok: false, problem: "Veri bir nesne değil." };
