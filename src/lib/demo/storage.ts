@@ -4,24 +4,20 @@
  * - Yalnızca sentetik demo verisi içindir; gerçek veya hassas veri girilmemelidir.
  * - Tarayıcı depolaması kapalı veya dolu olabilir; tüm erişimler hata yakalanarak yapılır
  *   ve sonuç çağırana açıkça bildirilir (sessizce "kaydedildi" sayılmaz).
- * - Okunan veri iç içe yapısıyla birlikte doğrulanır. Bozuk veri otomatik olarak
- *   silinmez veya üzerine yazılmaz; ayrı bir anahtara yedeklenir.
+ * - Okunan veri iç içe yapısıyla birlikte doğrulanır ve gerekiyorsa güncel şemaya geçirilir
+ *   (bkz. migrations.ts). Bozuk veri veya başarısız geçiş otomatik olarak silinmez ya da
+ *   üzerine yazılmaz; ayrı bir anahtara yedeklenir ve kurtarma moduna geçilir.
  */
-import {
-  ANALYSIS_STATUSES,
-  DEFECT_STATUSES,
-  DEMO_SCHEMA_VERSION,
-  IMPACT_LEVELS,
-  MOSCOW_PRIORITIES,
-  PRIORITIES,
-  PROJECT_STATUSES,
-  REQUEST_STATUSES,
-  REQUIREMENT_STATUSES,
-  REQUIREMENT_TYPES,
-  TEST_RESULTS,
-  type DemoState,
-} from "../domain/types";
+import type { DemoState } from "../domain/types";
+import { migrateToCurrent } from "./migrations";
+import { findDemoStateV1Problem } from "./validation";
 
+export { findDemoStateProblem, isDemoState } from "./validation";
+
+/**
+ * Ana demo verisi anahtarı. Adındaki "v1" tarihsel anahtar adıdır ve mevcut kullanıcı
+ * verisine erişimi korumak için değiştirilmez; içerikteki şema sürümü `schemaVersion` alanındadır.
+ */
 export const DEMO_STORAGE_KEY = "flowpilot.demo.v1";
 /**
  * Okunamayan verinin dokunulmadan kopyalandığı yedeklerin anahtar öneki.
@@ -31,137 +27,6 @@ export const DEMO_STORAGE_KEY = "flowpilot.demo.v1";
 export const DEMO_BACKUP_PREFIX = "flowpilot.demo.v1.yedek";
 /** Saklanacak en fazla yedek sayısı. Sınır dolunca yedek otomatik silinmez; yeni yedek alınmaz. */
 export const MAX_BACKUPS = 3;
-
-/* ------------------------------------------------------------------ */
-/* Doğrulama                                                           */
-/* ------------------------------------------------------------------ */
-
-type Rec = Record<string, unknown>;
-const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
-const isStr = (v: unknown): v is string => typeof v === "string";
-const isBool = (v: unknown): v is boolean => typeof v === "boolean";
-const isStrArr = (v: unknown): v is string[] => Array.isArray(v) && v.every(isStr);
-const optStr = (v: unknown) => v === undefined || isStr(v);
-const oneOf = (list: readonly string[]) => (v: unknown) => isStr(v) && list.includes(v);
-const hasStrings = (r: Rec, keys: string[]) => keys.every((k) => isStr(r[k]));
-
-function isProject(v: unknown): boolean {
-  return (
-    isRec(v) &&
-    hasStrings(v, ["id", "code", "name", "description", "owner", "startDate", "targetDate"]) &&
-    oneOf(PROJECT_STATUSES)(v.status)
-  );
-}
-
-function isRequest(v: unknown): boolean {
-  if (!isRec(v)) return false;
-  if (!hasStrings(v, ["id", "code", "projectId", "title", "description", "requester", "createdAt", "updatedAt"])) return false;
-  if (!oneOf(PRIORITIES)(v.priority) || !oneOf(REQUEST_STATUSES)(v.status) || !optStr(v.dueDate)) return false;
-  const d = v.details;
-  if (!isRec(d)) return false;
-  if (v.type === "new") return hasStrings(d, ["businessGoal", "targetUsers", "expectedBenefit"]);
-  if (v.type === "change")
-    return hasStrings(d, ["affectedSystem", "currentBehavior", "desiredBehavior", "changeReason"]) && oneOf(IMPACT_LEVELS)(d.impactLevel);
-  return false;
-}
-
-function isSection(v: unknown): boolean {
-  if (!isRec(v) || !hasStrings(v, ["id", "title"])) return false;
-  switch (v.kind) {
-    case "text":
-      return isStr(v.content);
-    case "list":
-      return isStrArr(v.items);
-    case "checklist":
-      return Array.isArray(v.items) && v.items.every((i) => isRec(i) && isStr(i.id) && isStr(i.text) && isBool(i.done));
-    default:
-      return false;
-  }
-}
-
-function isAnalysis(v: unknown): boolean {
-  return (
-    isRec(v) &&
-    hasStrings(v, ["id", "code", "requestId", "title", "author", "createdAt", "updatedAt"]) &&
-    optStr(v.description) &&
-    oneOf(ANALYSIS_STATUSES)(v.status) &&
-    Array.isArray(v.sections) &&
-    v.sections.every(isSection)
-  );
-}
-
-function isRequirement(v: unknown): boolean {
-  return (
-    isRec(v) &&
-    hasStrings(v, ["id", "code", "requestId", "analysisId", "title", "description", "createdAt"]) &&
-    (v.sectionId === null || isStr(v.sectionId)) &&
-    oneOf(REQUIREMENT_TYPES)(v.type) &&
-    oneOf(MOSCOW_PRIORITIES)(v.priority) &&
-    oneOf(REQUIREMENT_STATUSES)(v.status) &&
-    isStrArr(v.acceptanceCriteria)
-  );
-}
-
-function isTestCase(v: unknown): boolean {
-  return (
-    isRec(v) &&
-    hasStrings(v, ["id", "code", "title", "expectedResult"]) &&
-    isStrArr(v.requirementIds) &&
-    isStrArr(v.steps) &&
-    oneOf(PRIORITIES)(v.priority)
-  );
-}
-
-function isTestRun(v: unknown): boolean {
-  return (
-    isRec(v) &&
-    hasStrings(v, ["id", "code", "testCaseId", "executedBy", "executedAt"]) &&
-    oneOf(TEST_RESULTS)(v.result) &&
-    optStr(v.note)
-  );
-}
-
-function isDefect(v: unknown): boolean {
-  return (
-    isRec(v) &&
-    hasStrings(v, ["id", "code", "title", "createdAt"]) &&
-    oneOf(PRIORITIES)(v.severity) &&
-    oneOf(DEFECT_STATUSES)(v.status) &&
-    optStr(v.requirementId) &&
-    optStr(v.testRunId) &&
-    optStr(v.assignee)
-  );
-}
-
-const COLLECTION_VALIDATORS = {
-  projects: isProject,
-  requests: isRequest,
-  analyses: isAnalysis,
-  requirements: isRequirement,
-  testCases: isTestCase,
-  testRuns: isTestRun,
-  defects: isDefect,
-} satisfies Record<Exclude<keyof DemoState, "schemaVersion">, (v: unknown) => boolean>;
-
-/**
- * Verinin beklenen yapıda olup olmadığını kontrol eder.
- * Sorun varsa okunabilir bir açıklama döndürür, yoksa null.
- */
-export function findDemoStateProblem(value: unknown): string | null {
-  if (!isRec(value)) return "Veri bir nesne değil.";
-  if (value.schemaVersion !== DEMO_SCHEMA_VERSION) return `Desteklenmeyen şema sürümü (${String(value.schemaVersion)}).`;
-  for (const [key, validate] of Object.entries(COLLECTION_VALIDATORS)) {
-    const list = value[key];
-    if (!Array.isArray(list)) return `"${key}" listesi eksik veya hatalı.`;
-    const index = list.findIndex((item) => !validate(item));
-    if (index !== -1) return `"${key}" listesindeki ${index + 1}. kayıt hatalı.`;
-  }
-  return null;
-}
-
-export function isDemoState(value: unknown): value is DemoState {
-  return findDemoStateProblem(value) === null;
-}
 
 /* ------------------------------------------------------------------ */
 /* Okuma / yazma                                                       */
@@ -178,7 +43,8 @@ export type BackupOutcome = "created" | "exists" | "limit" | "failed";
 
 export type StorageReadResult =
   | { kind: "empty" }
-  | { kind: "ok"; state: DemoState }
+  /** `migratedFrom`: veri eski bir şemadan bellekte geçirildiyse kaynak sürüm, değilse null. */
+  | { kind: "ok"; state: DemoState; migratedFrom: number | null }
   | { kind: "invalid"; raw: string; problem: string; backup: BackupOutcome }
   | { kind: "unavailable" };
 
@@ -187,7 +53,12 @@ export type BackupInfo = {
   /** Yedeğin alındığı zaman; önceki sürümün tekil yedeğinde bilinmez (null). */
   createdAt: string | null;
   size: number;
+  /** Şema geçişinden önce alınan yedek mi? */
+  preMigration: boolean;
 };
+
+/** Şema v1 → v2 geçişinden önce alınan yedeklerin anahtar eki. */
+const PRE_MIGRATION_SUFFIX = "-gecis-oncesi-v1";
 
 export type StorageWriteResult = { ok: true } | { ok: false; reason: "unavailable" | "write-failed" };
 
@@ -214,13 +85,13 @@ function backupKeys(storage: Storage): string[] {
  * Bozuk veriyi ana anahtara dokunmadan yeni bir yedek anahtarına kopyalar.
  * Mevcut hiçbir yedeğin üzerine yazmaz ve sınır dolunca yedek silmez.
  */
-function backupRaw(storage: Storage, raw: string): BackupOutcome {
+function backupRaw(storage: Storage, raw: string, suffix = ""): BackupOutcome {
   try {
     const keys = backupKeys(storage);
     if (keys.some((key) => storage.getItem(key) === raw)) return "exists";
     if (keys.length >= MAX_BACKUPS) return "limit";
-    let key = `${DEMO_BACKUP_PREFIX}.${new Date().toISOString()}`;
-    for (let n = 2; storage.getItem(key) !== null; n++) key = `${DEMO_BACKUP_PREFIX}.${new Date().toISOString()}-${n}`;
+    let key = `${DEMO_BACKUP_PREFIX}.${new Date().toISOString()}${suffix}`;
+    for (let n = 2; storage.getItem(key) !== null; n++) key = `${DEMO_BACKUP_PREFIX}.${new Date().toISOString()}-${n}${suffix}`;
     storage.setItem(key, raw);
     return "created";
   } catch {
@@ -238,6 +109,7 @@ export function listBackups(): BackupInfo[] {
         key,
         createdAt: key === DEMO_BACKUP_PREFIX ? null : key.slice(DEMO_BACKUP_PREFIX.length + 1, DEMO_BACKUP_PREFIX.length + 25),
         size: storage.getItem(key)?.length ?? 0,
+        preMigration: key.endsWith(PRE_MIGRATION_SUFFIX),
       }))
       .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
   } catch {
@@ -283,9 +155,25 @@ export function readDemoStorage(): StorageReadResult {
   } catch {
     return { kind: "invalid", raw, problem: "Veri geçerli JSON değil.", backup: backupRaw(storage, raw) };
   }
-  const problem = findDemoStateProblem(parsed);
-  if (problem) return { kind: "invalid", raw, problem, backup: backupRaw(storage, raw) };
-  return { kind: "ok", state: parsed as DemoState };
+  // Geçerli v1 veri: geçişten önce tek seferlik yedek zorunlu. Yedek alınamazsa geçiş yapılmaz;
+  // veri korunur ve kurtarma bildirimiyle kullanıcıya bildirilir (3 yedek sınırı aşılmaz).
+  if ((parsed as { schemaVersion?: unknown } | null)?.schemaVersion === 1 && findDemoStateV1Problem(parsed) === null) {
+    const backup = backupRaw(storage, raw, PRE_MIGRATION_SUFFIX);
+    if (backup === "limit" || backup === "failed") {
+      return {
+        kind: "invalid",
+        raw,
+        backup,
+        problem:
+          "Veriniz eski şemada (v1). Güncel sürüme geçirilmeden önce yedeklenmesi gerekiyor, ancak yedek alınamadı; geçiş yapılmadı ve veriniz olduğu gibi korunuyor.",
+      };
+    }
+  }
+
+  // Doğrula ve gerekiyorsa güncel şemaya geçir. Başarısız geçişte ham veri korunur ve yedeklenir.
+  const migration = migrateToCurrent(parsed);
+  if (!migration.ok) return { kind: "invalid", raw, problem: migration.problem, backup: backupRaw(storage, raw) };
+  return { kind: "ok", state: migration.state, migratedFrom: migration.migratedFrom };
 }
 
 export function writeDemoStorage(state: DemoState): StorageWriteResult {

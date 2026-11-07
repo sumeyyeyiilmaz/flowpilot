@@ -8,7 +8,9 @@ import { MAX_BACKUPS, type BackupInfo } from "@/lib/demo/storage";
 import { formatDateTime } from "@/lib/format";
 import { confirmAndDeleteBackup, downloadBackup } from "./demo-backup";
 
-const backupLabel = (b: BackupInfo) => (b.createdAt ? `Yedek · ${formatDateTime(b.createdAt)}` : "Yedek · önceki sürüm");
+const backupLabel = (b: BackupInfo) =>
+  (b.createdAt ? `Yedek · ${formatDateTime(b.createdAt)}` : "Yedek · önceki sürüm") +
+  (b.preMigration ? " (şema geçişi öncesi)" : "");
 
 /** Mevcut yedekleri listeler; her biri ayrı ayrı indirilebilir veya onayla silinebilir. */
 export function BackupList({ onMessage }: { onMessage: (message: string) => void }) {

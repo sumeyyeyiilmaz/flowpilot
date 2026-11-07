@@ -217,13 +217,109 @@ export type Defect = {
 };
 
 /* ------------------------------------------------------------------ */
+/* Agile / Sprint                                                      */
+/* ------------------------------------------------------------------ */
+
+/** Sentetik ekip üyesi (kişi adları kurgusaldır). */
+export type TeamMember = {
+  id: string;
+  name: string;
+  role: string;
+};
+
+export const WORK_ITEM_TYPES = ["Story", "Görev", "Hata", "Spike"] as const;
+export type WorkItemType = (typeof WORK_ITEM_TYPES)[number];
+
+/** Kanban sütunları. "Backlog" durumu Product Backlog'daki işleri temsil eder. */
+export const WORK_ITEM_STATUSES = ["Backlog", "Yapılacak", "Devam Ediyor", "İncelemede", "Tamamlandı"] as const;
+export type WorkItemStatus = (typeof WORK_ITEM_STATUSES)[number];
+
+/** Fibonacci story point ölçeği. */
+export const STORY_POINTS = [1, 2, 3, 5, 8, 13] as const;
+export type StoryPoint = (typeof STORY_POINTS)[number];
+
+/**
+ * Backlog / sprint işi.
+ * - `sprintId === null` ise iş Product Backlog'dadır.
+ * - "Hata" türündeki iş mevcut bir Defect kaydına (`defectId`) bağlıdır; diğer türlerde `defectId` null'dır.
+ *   Bir Defect en fazla bir işe bağlanabilir (mükerrer hata kaydı oluşmaz).
+ */
+export type WorkItem = {
+  id: string;
+  code: string; // PBI-001
+  projectId: string;
+  type: WorkItemType;
+  title: string;
+  description: string;
+  status: WorkItemStatus;
+  /** Product Backlog sırası (küçük olan üstte). */
+  rank: number;
+  storyPoints: StoryPoint | null;
+  estimateHours?: number;
+  assigneeId: string | null;
+  sprintId: string | null;
+  /** İzlenebilirlik (isteğe bağlı). */
+  requestId?: string;
+  analysisId?: string;
+  requirementIds: string[];
+  defectId: string | null;
+  createdAt: ISODateString;
+  updatedAt: ISODateString;
+  /** "Tamamlandı" durumuna geçtiği an (Burndown/Velocity için). */
+  completedAt?: ISODateString;
+};
+
+export const SPRINT_STATUSES = ["Planlandı", "Aktif", "Tamamlandı"] as const;
+export type SprintStatus = (typeof SPRINT_STATUSES)[number];
+
+/**
+ * Sprint kapatıldığı andaki değişmez özet. Sonradan işlerin puanı değişse veya bitmemiş işler
+ * backlog'a dönse de tamamlanan sprintin geçmiş işleri ve puanları korunur.
+ */
+export type SprintSummary = {
+  committedPoints: number;
+  completedPoints: number;
+  completedItems: { workItemId: string; storyPoints: number }[];
+  carriedOverItemIds: string[];
+};
+
+export type Sprint = {
+  id: string;
+  code: string; // SPR-01
+  projectId: string;
+  name: string;
+  goal: string;
+  /** Takvim günü, YYYY-MM-DD. */
+  startDate: string;
+  endDate: string;
+  status: SprintStatus;
+  completedAt?: ISODateString;
+  /** Yalnızca "Tamamlandı" durumunda bulunur. */
+  summary?: SprintSummary;
+};
+
+/** Daily Scrum kaydı. Sprint + kişi + tarih bazında tekildir; tekrar girişte güncellenir. */
+export type DailyScrumEntry = {
+  id: string;
+  sprintId: string;
+  memberId: string;
+  /** Takvim günü, YYYY-MM-DD. */
+  date: string;
+  yesterday: string;
+  today: string;
+  blockers: string;
+  updatedAt: ISODateString;
+};
+
+/* ------------------------------------------------------------------ */
 /* Demo durumu                                                         */
 /* ------------------------------------------------------------------ */
 
-export const DEMO_SCHEMA_VERSION = 1;
+export const DEMO_SCHEMA_VERSION = 2;
 
-export type DemoState = {
-  schemaVersion: typeof DEMO_SCHEMA_VERSION;
+/** Şema v1 (Agile modülünden önce). Geçiş (migration) için korunur. */
+export type DemoStateV1 = {
+  schemaVersion: 1;
   projects: Project[];
   requests: WorkRequest[];
   analyses: Analysis[];
@@ -231,4 +327,12 @@ export type DemoState = {
   testCases: TestCase[];
   testRuns: TestRun[];
   defects: Defect[];
+};
+
+export type DemoState = Omit<DemoStateV1, "schemaVersion"> & {
+  schemaVersion: typeof DEMO_SCHEMA_VERSION;
+  teamMembers: TeamMember[];
+  workItems: WorkItem[];
+  sprints: Sprint[];
+  dailyScrums: DailyScrumEntry[];
 };

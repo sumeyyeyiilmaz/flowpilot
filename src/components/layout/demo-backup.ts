@@ -35,7 +35,7 @@ export function downloadCurrentData(): boolean {
 export function downloadBackup(backup: BackupInfo): boolean {
   const raw = demoActions.readBackup(backup.key);
   if (!raw) return false;
-  const stamp = backup.createdAt ? fileStamp(backup.createdAt) : "onceki-surum";
+  const stamp = (backup.createdAt ? fileStamp(backup.createdAt) : "onceki-surum") + (backup.preMigration ? "-gecis-oncesi-v1" : "");
   saveFile(raw, `flowpilot-demo-YEDEK-${stamp}.json`);
   return true;
 }

@@ -603,6 +603,11 @@ const SEED_STATE: DemoState = {
   testCases,
   testRuns,
   defects,
+  // Agile koleksiyonları (şema v2). Sentetik agile başlangıç verisi sonraki adımda eklenecek.
+  teamMembers: [],
+  workItems: [],
+  sprints: [],
+  dailyScrums: [],
 };
 
 /** Her çağrıda başlangıç verisinin bağımsız bir kopyasını döndürür. */
