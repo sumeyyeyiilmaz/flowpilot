@@ -16,12 +16,13 @@
  * Geçersiz bir işlem state'i değiştirmez (aynı referans döner).
  */
 import {
+  SPRINT_BOARD_STATUSES,
   STORY_POINTS,
   type DemoState,
   type Sprint,
   type StoryPoint,
   type WorkItem,
-  type WorkItemStatus,
+  type SprintBoardStatus,
   type WorkItemType,
 } from "../domain/types";
 import { nextCode, type ActionMeta } from "./reducer";
@@ -73,7 +74,7 @@ export type AgileAction =
   | { type: "workItem/rank"; meta: ActionMeta; workItemId: string; direction: "up" | "down" }
   | { type: "workItem/addToSprint"; meta: ActionMeta; workItemId: string; sprintId: string }
   | { type: "workItem/removeFromSprint"; meta: ActionMeta; workItemId: string }
-  | { type: "workItem/setStatus"; meta: ActionMeta; workItemId: string; status: WorkItemStatus }
+  | { type: "workItem/setStatus"; meta: ActionMeta; workItemId: string; status: SprintBoardStatus }
   | { type: "sprint/create"; meta: ActionMeta; input: NewSprintInput }
   | { type: "sprint/update"; meta: ActionMeta; sprintId: string; changes: SprintChanges }
   | { type: "sprint/start"; meta: ActionMeta; sprintId: string }
@@ -292,7 +293,8 @@ export function agileReducer(state: DemoState, action: AgileAction): DemoState {
 
     case "workItem/setStatus":
       return replaceItem(state, action.workItemId, (item) => {
-        if (item.status === action.status || action.status === "Backlog") return null;
+        // Tip SprintBoardStatus ile sınırlı; tip dışı çağrılara karşı çalışma anında da doğrulanır.
+        if (item.status === action.status || !(SPRINT_BOARD_STATUSES as readonly string[]).includes(action.status)) return null;
         const sprint = sprintOf(state, item);
         if (!sprint || sprint.status !== "Aktif") return null; // Kanban yalnızca aktif sprintte
         const { completedAt: _completed, ...rest } = item;

@@ -234,6 +234,13 @@ export type WorkItemType = (typeof WORK_ITEM_TYPES)[number];
 export const WORK_ITEM_STATUSES = ["Backlog", "Yapılacak", "Devam Ediyor", "İncelemede", "Tamamlandı"] as const;
 export type WorkItemStatus = (typeof WORK_ITEM_STATUSES)[number];
 
+/**
+ * Sprint panosundaki (Kanban) durumlar. "Backlog" bir Kanban durumu değildir:
+ * sprintsiz işler (`sprintId === null`) her zaman "Backlog", sprintteki işler her zaman bu dört durumdan birindedir.
+ */
+export const SPRINT_BOARD_STATUSES = ["Yapılacak", "Devam Ediyor", "İncelemede", "Tamamlandı"] as const satisfies readonly WorkItemStatus[];
+export type SprintBoardStatus = (typeof SPRINT_BOARD_STATUSES)[number];
+
 /** Fibonacci story point ölçeği. */
 export const STORY_POINTS = [1, 2, 3, 5, 8, 13] as const;
 export type StoryPoint = (typeof STORY_POINTS)[number];

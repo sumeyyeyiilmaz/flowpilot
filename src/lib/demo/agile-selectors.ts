@@ -4,7 +4,7 @@
  * - Tamamlanan sprintlerde puanlar değişmez özetten (summary) okunur; geçmiş korunur.
  * - Gün sınırları Europe/Istanbul saat dilimine göre belirlenir.
  */
-import type { DemoState, Sprint, WorkItem, WorkItemStatus } from "../domain/types";
+import { SPRINT_BOARD_STATUSES, type DemoState, type Sprint, type WorkItem } from "../domain/types";
 
 const TIME_ZONE = "Europe/Istanbul";
 const dayFormatter = new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -48,12 +48,10 @@ export const getBacklog = (s: DemoState, projectId: string) =>
 export const getSprintItems = (s: DemoState, sprintId: string) =>
   s.workItems.filter((w) => w.sprintId === sprintId).sort((a, b) => a.rank - b.rank);
 
-const BOARD_COLUMNS: Exclude<WorkItemStatus, "Backlog">[] = ["Yapılacak", "Devam Ediyor", "İncelemede", "Tamamlandı"];
-
 /** Kanban panosu: sprint işleri durum sütunlarına göre. */
 export function getSprintBoard(s: DemoState, sprintId: string) {
   const items = getSprintItems(s, sprintId);
-  return BOARD_COLUMNS.map((status) => ({ status, items: items.filter((w) => w.status === status) }));
+  return SPRINT_BOARD_STATUSES.map((status) => ({ status, items: items.filter((w) => w.status === status) }));
 }
 
 /** Daily Scrum kayıtları (isteğe bağlı gün filtresi), tarih ve kişiye göre. */

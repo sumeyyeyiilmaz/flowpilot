@@ -14,7 +14,7 @@
  * - Veritabanı, API veya harici servis kullanılmaz.
  */
 import { useSyncExternalStore } from "react";
-import type { AnalysisSection, DemoState, SectionKind, WorkItemStatus } from "../domain/types";
+import type { AnalysisSection, DemoState, SectionKind, SprintBoardStatus } from "../domain/types";
 import {
   demoReducer,
   normalizeDemoState,
@@ -302,7 +302,7 @@ export const demoActions = {
     return dispatchChanged({ type: "workItem/removeFromSprint", meta: createMeta(), workItemId });
   },
 
-  setWorkItemStatus(workItemId: string, status: WorkItemStatus): boolean {
+  setWorkItemStatus(workItemId: string, status: SprintBoardStatus): boolean {
     return dispatchChanged({ type: "workItem/setStatus", meta: createMeta(), workItemId, status });
   },
 

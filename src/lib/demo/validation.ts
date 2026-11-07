@@ -241,9 +241,19 @@ function findAgileRelationProblem(state: DemoState): string | null {
     if (count > 1) return `${projectId} projesinde birden fazla aktif sprint var.`;
   }
 
+  const completedSprintIds = new Set(state.sprints.filter((s) => s.status === "Tamamlandı").map((s) => s.id));
   for (const item of state.workItems) {
     if (!projectIds.has(item.projectId)) return `${item.code} işi olmayan bir projeye bağlı.`;
     if (item.sprintId !== null && !sprintIds.has(item.sprintId)) return `${item.code} işi olmayan bir sprinte bağlı.`;
+    // Product Backlog ile Sprint Kanban durumları ayrıdır.
+    if (item.sprintId === null && item.status !== "Backlog") return `${item.code} işi sprintte değil ama durumu "${item.status}".`;
+    if (item.sprintId !== null && item.status === "Backlog") return `${item.code} işi sprintte ama durumu "Backlog".`;
+    // Tamamlanma zamanı yalnızca tamamlanan işte bulunur.
+    if (item.status === "Tamamlandı" && item.completedAt === undefined) return `${item.code} işi tamamlanmış ama tamamlanma zamanı yok.`;
+    if (item.status !== "Tamamlandı" && item.completedAt !== undefined) return `${item.code} işi tamamlanmamış ama tamamlanma zamanı var.`;
+    // Tamamlanan sprintte bitmemiş iş kalamaz (bitmemiş işler kapanışta backlog'a döner).
+    if (item.sprintId !== null && completedSprintIds.has(item.sprintId) && item.status !== "Tamamlandı")
+      return `${item.code} işi tamamlanmış bir sprintte ama durumu "${item.status}".`;
     if (item.assigneeId !== null && !memberIds.has(item.assigneeId)) return `${item.code} işi olmayan bir ekip üyesine atanmış.`;
     if (item.defectId !== null && !defectIds.has(item.defectId)) return `${item.code} işi olmayan bir hata kaydına bağlı.`;
   }
