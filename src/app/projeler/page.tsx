@@ -7,7 +7,7 @@ export const metadata: Metadata = { title: "Projeler" };
 export default function Page() {
   return (
     <>
-      <PageHeader title="Projeler" description="Projeleri, talep yoğunluğunu ve kalite durumunu izleyin." />
+      <PageHeader title="Projeler" description="Projeleri, talep yoğunluğunu ve teslimat durumunu izleyin." />
       <ProjectList />
     </>
   );

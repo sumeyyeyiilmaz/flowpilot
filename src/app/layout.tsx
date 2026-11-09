@@ -18,7 +18,7 @@ export const metadata: Metadata = {
     default: "FlowPilot",
     template: "%s · FlowPilot",
   },
-  description: "FlowPilot kalite ve proje yönetim platformu (demo)",
+  description: "FlowPilot — Agile odaklı Proje Yönetim Sistemi (demo)",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

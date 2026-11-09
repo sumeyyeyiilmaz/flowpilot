@@ -14,7 +14,7 @@ export function SidebarFooter() {
           </span>
           <div className="min-w-0 flex-1 leading-tight">
             <p className="truncate text-sm font-medium">Demo Kullanıcı</p>
-            <p className="truncate text-xs text-muted-foreground">Kalite Yöneticisi</p>
+            <p className="truncate text-xs text-muted-foreground">Proje Yöneticisi</p>
           </div>
         </div>
       </div>

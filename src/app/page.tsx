@@ -10,7 +10,7 @@ import { dashboardStats, projectProgress, recentActivities } from "@/lib/demo-da
 export default function OverviewPage() {
   return (
     <>
-      <PageHeader title="Genel Bakış" description="Proje portföyünüzün kalite ve teslimat durumu">
+      <PageHeader title="Genel Bakış" description="Proje portföyünüzün teslimat ve ilerleme durumu">
         <Button asChild>
           <Link href="/projeler">
             <Plus data-icon="inline-start" aria-hidden="true" />

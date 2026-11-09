@@ -12,7 +12,7 @@ export function Brand() {
       </span>
       <span className="flex flex-col leading-none">
         <span className="text-[15px] font-semibold tracking-tight">FlowPilot</span>
-        <span className="text-[11px] text-muted-foreground">Kalite Yönetim Platformu</span>
+        <span className="text-[11px] text-muted-foreground">Proje Yönetim Sistemi</span>
       </span>
     </Link>
   );
