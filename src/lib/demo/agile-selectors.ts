@@ -195,3 +195,106 @@ export function getTraceForWorkItem(s: DemoState, workItemId: string) {
     sprint: item.sprintId ? getSprint(s, item.sprintId) : undefined,
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Metrik raporları (verinin desteklemediği değer üretilmez)           */
+/* ------------------------------------------------------------------ */
+
+export type BurndownReport =
+  | { kind: "not-started" }
+  | { kind: "no-points"; unestimatedItems: number }
+  | { kind: "before-start"; total: number }
+  | {
+      kind: "chart";
+      points: BurndownPoint[];
+      total: number;
+      /** "summary": kapanıştaki değişmez özet; "current": aktif sprintin mevcut kapsamı. */
+      basis: "summary" | "current";
+      /** Sprint tarihleri dışında tamamlanan puanlar (grafikte gün olarak gösterilemez). */
+      completedBeforeStart: number;
+      completedAfterEnd: number;
+      /** Story Point tahmini olmayan sprint işleri (grafiğe yansımaz). */
+      unestimatedItems: number;
+      /** Aktif sprintin bitiş tarihi geçti mi? */
+      overdue: boolean;
+    };
+
+/**
+ * Burndown raporu. MVP hesabı günlük geçmiş anlık görüntülerine dayanmaz: kalan puan,
+ * kapsam (tamamlanan sprintte kapanış özeti, aktif sprintte mevcut işler) eksi o güne kadar
+ * tamamlanan işlerin puanıdır. Gelecek günler için değer üretilmez.
+ * `today` (YYYY-MM-DD, Europe/Istanbul) aktif sprint için zorunludur; verilmezse null döner.
+ */
+export function getBurndownReport(s: DemoState, sprintId: string, today?: string): BurndownReport | null {
+  const sprint = getSprint(s, sprintId);
+  if (!sprint) return null;
+  if (sprint.status === "Planlandı") return { kind: "not-started" };
+  if (sprint.status === "Aktif" && today === undefined) return null;
+
+  const items = getSprintItems(s, sprintId);
+  const unestimatedItems = sprint.summary ? 0 : items.filter((w) => w.storyPoints === null).length;
+  const total = getSprintPoints(s, sprintId).committed;
+  if (total === 0) return { kind: "no-points", unestimatedItems };
+  if (sprint.status === "Aktif" && today! < sprint.startDate) return { kind: "before-start", total };
+
+  const completions = sprint.summary
+    ? sprint.summary.completedItems.flatMap((ci) => {
+        const w = getWorkItem(s, ci.workItemId);
+        return w?.completedAt ? [{ day: toCalendarDay(w.completedAt), points: ci.storyPoints }] : [];
+      })
+    : items.filter((w) => w.status === "Tamamlandı" && w.completedAt).map((w) => ({ day: toCalendarDay(w.completedAt!), points: w.storyPoints ?? 0 }));
+
+  return {
+    kind: "chart",
+    points: getBurndown(s, sprintId, sprint.status === "Aktif" ? today : undefined),
+    total,
+    basis: sprint.summary ? "summary" : "current",
+    completedBeforeStart: completions.filter((c) => c.day < sprint.startDate).reduce((a, c) => a + c.points, 0),
+    completedAfterEnd: completions.filter((c) => c.day > sprint.endDate).reduce((a, c) => a + c.points, 0),
+    unestimatedItems,
+    overdue: sprint.status === "Aktif" && today! > sprint.endDate,
+  };
+}
+
+export type SprintComparisonRow = {
+  sprint: Sprint;
+  committed: number;
+  completed: number;
+  /** Tamamlanma oranı (0–1); taahhüt 0 ise null. */
+  completionRate: number | null;
+  completedItemCount: number;
+  carriedOverCount: number;
+};
+
+/** Tamamlanan sprintlerin karşılaştırması (yalnızca değişmez özetlerden), en yeniden eskiye. */
+export function getSprintComparison(s: DemoState, projectId: string): SprintComparisonRow[] {
+  return getProjectSprintsByStatus(s, projectId, "Tamamlandı")
+    .filter((sp) => sp.summary)
+    .map((sp) => {
+      const { committedPoints, completedPoints, completedItems, carriedOverItemIds } = sp.summary!;
+      return {
+        sprint: sp,
+        committed: committedPoints,
+        completed: completedPoints,
+        completionRate: committedPoints > 0 ? completedPoints / committedPoints : null,
+        completedItemCount: completedItems.length,
+        carriedOverCount: carriedOverItemIds.length,
+      };
+    });
+}
+
+/** Proje bazında özet metrikler. Velocity yalnızca tamamlanan sprintlerden hesaplanır. */
+export function getProjectAgileMetrics(s: DemoState, projectId: string) {
+  const velocity = getVelocity(s, projectId);
+  const active = getActiveSprint(s, projectId);
+  const backlog = getBacklog(s, projectId);
+  return {
+    velocity,
+    completedSprintCount: getProjectSprintsByStatus(s, projectId, "Tamamlandı").length,
+    activeSprint: active,
+    activePoints: active ? getSprintPoints(s, active.id) : null,
+    backlogItems: backlog.length,
+    backlogPoints: backlog.reduce((sum, w) => sum + (w.storyPoints ?? 0), 0),
+    backlogUnestimated: backlog.filter((w) => w.storyPoints === null).length,
+  };
+}

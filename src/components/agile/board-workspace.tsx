@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { AlertCircle, ArrowLeft, CalendarRange, Lock, Target, X } from "lucide-react";
+import { AlertCircle, ArrowLeft, CalendarRange, ChartLine, Lock, Target, X } from "lucide-react";
 import { SaveNotice } from "@/components/common/save-notice";
 import { SprintStatusBadge } from "@/components/common/status-badges";
 import { PageHeader } from "@/components/layout/page-header";
@@ -11,7 +11,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { boardEditBlocker, getDefaultBoardSprint, getProjectSprints, getSprintPoints } from "@/lib/demo/agile-selectors";
 import { useDemoState } from "@/lib/demo/store";
 import { formatDate } from "@/lib/format";
-import { sprintBoardHref, sprintPlanningHref } from "@/lib/routes";
+import { sprintBoardHref, sprintMetricsHref, sprintPlanningHref } from "@/lib/routes";
 import { cn } from "@/lib/utils";
 import { DailyScrumPanel } from "./daily-scrum-panel";
 import { KanbanBoard } from "./kanban-board";
@@ -43,6 +43,10 @@ export function BoardWorkspace() {
         <Link href={sprintPlanningHref(projectId)} className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
           <ArrowLeft className="size-4" aria-hidden="true" />
           Sprint planlama
+        </Link>
+        <Link href={sprintMetricsHref(projectId, sprint?.id)} className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+          <ChartLine className="size-4" aria-hidden="true" />
+          Metrikler
         </Link>
       </PageHeader>
 

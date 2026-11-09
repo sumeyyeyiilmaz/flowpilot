@@ -2,13 +2,14 @@
 
 import { useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { AlertCircle, X } from "lucide-react";
+import Link from "next/link";
+import { AlertCircle, ChartLine, X } from "lucide-react";
 import { SaveNotice } from "@/components/common/save-notice";
 import { PageHeader } from "@/components/layout/page-header";
 import { getActiveSprint, getBacklog } from "@/lib/demo/agile-selectors";
 import { useDemoState } from "@/lib/demo/store";
 import type { Sprint, WorkItem } from "@/lib/domain/types";
-import { sprintPlanningHref } from "@/lib/routes";
+import { sprintMetricsHref, sprintPlanningHref } from "@/lib/routes";
 import { cn } from "@/lib/utils";
 import { BacklogPanel } from "./backlog-panel";
 import { SprintDialog } from "./sprint-dialog";
@@ -40,7 +41,12 @@ export function PlanningWorkspace() {
 
   return (
     <>
-      <PageHeader title="Sprint Planlama" description="Product Backlog'u önceliklendirin, sprintleri planlayın ve işleri atayın." />
+      <PageHeader title="Sprint Planlama" description="Product Backlog'u önceliklendirin, sprintleri planlayın ve işleri atayın.">
+        <Link href={sprintMetricsHref(projectId)} className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+          <ChartLine className="size-4" aria-hidden="true" />
+          Metrikler
+        </Link>
+      </PageHeader>
 
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div className="flex flex-col gap-1.5 sm:w-80">

@@ -10,6 +10,13 @@ export function sprintBoardHref(projectId: string, sprintId?: string) {
   return `/sprintler/pano?${params.toString()}`;
 }
 
+/** Agile metrikleri adresi: /sprintler/metrikler?proje=…[&sprint=…] */
+export function sprintMetricsHref(projectId: string, sprintId?: string) {
+  const params = new URLSearchParams({ proje: projectId });
+  if (sprintId) params.set("sprint", sprintId);
+  return `/sprintler/metrikler?${params.toString()}`;
+}
+
 /** Analiz çalışma alanı adresi: /talepler/analiz?talep=…[&analiz=…] */
 export function analysisHref(requestId: string, analysisId?: string) {
   const params = new URLSearchParams({ talep: requestId });
