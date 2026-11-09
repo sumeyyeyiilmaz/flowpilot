@@ -1,7 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { CalendarRange, Flag, Lock, Pencil, Play, Plus, Target, Undo2, UserRound } from "lucide-react";
+import Link from "next/link";
+import { CalendarRange, Flag, Lock, Pencil, Play, Plus, SquareKanban, Target, Undo2, UserRound } from "lucide-react";
+import { sprintBoardHref } from "@/lib/routes";
 import { SprintStatusBadge, StoryPointBadge, WorkItemStatusBadge, WorkItemTypeBadge } from "@/components/common/status-badges";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -122,6 +124,12 @@ function SprintCard({ state, sprint, onEditSprint, onEditItem, onMessage }: {
           )}
         </div>
         <div className="flex flex-wrap gap-1.5">
+          <Button asChild size="xs" variant="outline">
+            <Link href={sprintBoardHref(sprint.projectId, sprint.id)} aria-label={`${sprint.code} panosunu aç`}>
+              <SquareKanban data-icon="inline-start" aria-hidden="true" />
+              Panoyu aç
+            </Link>
+          </Button>
           {!completed && (
             <Button size="xs" variant="ghost" onClick={() => onEditSprint(sprint)} aria-label={`${sprint.code} düzenle`}>
               <Pencil data-icon="inline-start" aria-hidden="true" />

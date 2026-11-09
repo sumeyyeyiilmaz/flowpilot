@@ -158,6 +158,34 @@ export function sprintStartBlocker(s: DemoState, sprint: Sprint): string | null 
   return active ? `Projede zaten aktif bir sprint var (${active.code}).` : null;
 }
 
+/** Sprint panosu (Kanban) düzenlenemiyorsa nedenini döndürür. Yalnızca aktif sprint düzenlenebilir. */
+export function boardEditBlocker(sprint: Sprint): string | null {
+  if (sprint.status === "Tamamlandı") return "Tamamlanmış sprint salt okunurdur.";
+  if (sprint.status !== "Aktif") return "Sprint henüz başlamadı; Kanban yalnızca aktif sprintte düzenlenebilir.";
+  return null;
+}
+
+/** İşin durumu belirtilen duruma değiştirilemiyorsa nedenini, değiştirilebiliyorsa null döndürür. */
+export function statusChangeBlocker(s: DemoState, item: WorkItem, status: string): string | null {
+  if (!(SPRINT_BOARD_STATUSES as readonly string[]).includes(status)) return "Geçersiz Kanban durumu.";
+  const sprint = sprintOf(s, item);
+  if (!sprint) return "İş bir sprintte değil.";
+  const board = boardEditBlocker(sprint);
+  if (board) return board;
+  return item.status === status ? "İş zaten bu durumda." : null;
+}
+
+/** Daily Scrum kaydı girilemiyorsa nedenini döndürür (sprint aktif, kişi ekipte, tarih sprint aralığında olmalı). */
+export function dailyScrumBlocker(s: DemoState, input: { sprintId: string; memberId: string; date: string }): string | null {
+  const sprint = s.sprints.find((sp) => sp.id === input.sprintId);
+  if (!sprint) return "Sprint bulunamadı.";
+  if (sprint.status === "Tamamlandı") return "Tamamlanmış sprintin Daily Scrum kayıtları salt okunurdur.";
+  if (sprint.status !== "Aktif") return "Daily Scrum yalnızca aktif sprintte girilebilir.";
+  if (!s.teamMembers.some((m) => m.id === input.memberId)) return "Ekip üyesi bulunamadı.";
+  if (!isCalendarDate(input.date) || input.date < sprint.startDate || input.date > sprint.endDate) return "Tarih sprint aralığında olmalıdır.";
+  return null;
+}
+
 const nextBacklogRank = (s: DemoState, projectId: string) =>
   s.workItems.filter((w) => w.projectId === projectId).reduce((max, w) => Math.max(max, w.rank), 0) + 1;
 
@@ -326,10 +354,8 @@ export function agileReducer(state: DemoState, action: AgileAction): DemoState {
 
     case "workItem/setStatus":
       return replaceItem(state, action.workItemId, (item) => {
-        // Tip SprintBoardStatus ile sınırlı; tip dışı çağrılara karşı çalışma anında da doğrulanır.
-        if (item.status === action.status || !(SPRINT_BOARD_STATUSES as readonly string[]).includes(action.status)) return null;
-        const sprint = sprintOf(state, item);
-        if (!sprint || sprint.status !== "Aktif") return null; // Kanban yalnızca aktif sprintte
+        // Geçersiz durum (tip dışı çağrı dahil), aktif olmayan sprint veya aynı durum → değişiklik yok.
+        if (statusChangeBlocker(state, item, action.status)) return null;
         const { completedAt: _completed, ...rest } = item;
         void _completed;
         return {
@@ -418,10 +444,7 @@ export function agileReducer(state: DemoState, action: AgileAction): DemoState {
 
     case "daily/upsert": {
       const input = action.input;
-      const sprint = state.sprints.find((sp) => sp.id === input.sprintId);
-      if (!sprint || sprint.status !== "Aktif") return state;
-      if (!state.teamMembers.some((m) => m.id === input.memberId)) return state;
-      if (!isCalendarDate(input.date) || input.date < sprint.startDate || input.date > sprint.endDate) return state;
+      if (dailyScrumBlocker(state, input)) return state;
       const texts = { yesterday: input.yesterday.trim(), today: input.today.trim(), blockers: input.blockers.trim() };
       if (!texts.yesterday && !texts.today && !texts.blockers) return state;
 

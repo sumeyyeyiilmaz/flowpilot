@@ -7,7 +7,14 @@
 import { SPRINT_BOARD_STATUSES, type DemoState, type Sprint, type SprintStatus, type WorkItem } from "../domain/types";
 
 // Kural yardımcıları reducer ile aynı kaynaktan gelir (ekranlar kuralları yeniden yazmaz).
-export { isWorkItemLocked, sprintStartBlocker, workItemDeleteBlocker } from "./agile-reducer";
+export {
+  boardEditBlocker,
+  dailyScrumBlocker,
+  isWorkItemLocked,
+  sprintStartBlocker,
+  statusChangeBlocker,
+  workItemDeleteBlocker,
+} from "./agile-reducer";
 
 const TIME_ZONE = "Europe/Istanbul";
 const dayFormatter = new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -55,6 +62,16 @@ export const getAssignableSprints = (s: DemoState, projectId: string) =>
 export function getProjectRequirements(s: DemoState, projectId: string) {
   const requestIds = new Set(s.requests.filter((r) => r.projectId === projectId).map((r) => r.id));
   return s.requirements.filter((r) => requestIds.has(r.requestId));
+}
+
+/** Panoda varsayılan sprint: aktif, yoksa ilk planlanan, yoksa en son tamamlanan. */
+export function getDefaultBoardSprint(s: DemoState, projectId: string): Sprint | undefined {
+  const sprints = getProjectSprints(s, projectId);
+  return (
+    sprints.find((sp) => sp.status === "Aktif") ??
+    sprints.find((sp) => sp.status === "Planlandı") ??
+    [...sprints].reverse().find((sp) => sp.status === "Tamamlandı")
+  );
 }
 
 export const getActiveSprint = (s: DemoState, projectId: string) =>
