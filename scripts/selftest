@@ -1,0 +1,1297 @@
+#!/bin/sh
+# ANEW selftest — proves that scripts/check, scripts/doctor, scripts/residue, scripts/status, scripts/gate, scripts/adopt and scripts/upgrade
+# behave as documented.
+# Every scenario runs in a throwaway copy of this workspace in a temp dir OUTSIDE the repo
+# (docs/testing.md, Evidence policy), asserts on the real output and exit code, and is deleted.
+# Exit 0 = all scenarios pass, exit 1 = at least one failed. Runs in CI next to doctor.
+set -u
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+passed=0
+failed=0
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/anew-selftest.XXXXXX") || { echo "selftest: mktemp failed" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+# --- assertions on the last run: $out (stdout+stderr) and $rc ---
+run()    { out=$("$@" 2>&1); rc=$?; }
+report() { if [ "$1" -eq 0 ]; then passed=$((passed + 1)); echo "ok    $2"
+           else failed=$((failed + 1)); echo "FAIL  $2"; printf '%s\n' "$out" | sed 's/^/      | /'; fi; }
+exits()  { [ "$rc" -eq "$1" ]; report $? "$2 (exit $1)"; }
+has()    { printf '%s\n' "$out" | grep -qF -- "$1"; report $? "$2"; }
+hasnt()  { if printf '%s\n' "$out" | grep -qF -- "$1"; then report 1 "$2"; else report 0 "$2"; fi; }
+
+# --- scripts/check: a bare copy of the script with a conf per scenario ---
+C="$TMP/check"
+mkdir -p "$C/scripts"
+cp "$ROOT/scripts/check" "$C/scripts/check"
+conf() { printf '%s\n' "$@" > "$C/scripts/check.conf"; }
+check() { run sh "$C/scripts/check" "$@"; }
+
+echo "== scripts/check =="
+check
+exits 1 "no check.conf → refuses";                has "no scripts/check.conf yet" "no check.conf → says so"
+conf '# only a comment'
+check
+exits 0 "conf without steps → greenfield no-op";  has "greenfield no-op" "no-op is named"
+printf '   \n\t\n\r\n  # indented comment\n' > "$C/scripts/check.conf"
+check
+has "greenfield no-op" "whitespace-only lines, a CR line and an indented comment are not steps"
+hasnt "CHECK GREEN" "… and never count as a green step"
+printf '\302\240\n' > "$C/scripts/check.conf"   # a no-break space: not ASCII whitespace
+check
+hasnt "greenfield no-op" "a non-ASCII space line is a step in every shell (as for doctor and residue)"
+conf 'compile [fast]: echo compile ran' 'unit [fast]: echo unit ran' 'e2e: echo e2e ran'
+check --fast
+exits 0 "--fast, tagged conf";                    has "CHECK GREEN (fast, 2 steps" "--fast runs only [fast] steps"
+has "skip  e2e (full only)" "--fast names the skipped step";  hasnt "e2e ran" "--fast does not run untagged steps"
+has "==> unit" "tag is stripped from the displayed name";     hasnt "==> unit [fast]" "tag never shown as part of the name"
+check
+exits 0 "full, tagged conf";                      has "CHECK GREEN (full, 3 steps" "full runs every step"
+conf 'compile: echo compile ran' 'e2e: echo e2e ran'
+check --fast
+has "CHECK GREEN (fast = full: no steps tagged fast, 2 steps" "--fast on an untagged conf runs all and says so"
+conf 'compile: echo compile ran' 'unit: echo unit; exit 3' 'after: echo after ran'
+check
+exits 1 "red step fails the run";                 has "CHECK FAILED (full) at step: unit" "failure names profile and step"
+hasnt "after ran" "fail fast: later steps do not run"
+conf 'unit [fast]: exit 3'
+check --fast
+exits 1 "red fast step";                          has "CHECK FAILED (fast) at step: unit" "fast failure names the profile"
+check --fsat
+exits 2 "unknown argument";                       has "usage:" "unknown argument prints usage"
+check --fast extra
+exits 2 "extra argument";                         hasnt "==>" "a bad invocation runs nothing"
+conf 'first: echo first ran' 'greedy: cat > /dev/null; echo greedy ran' 'second: echo second ran'
+check
+has "second ran" "a step reading stdin cannot swallow the rest of check.conf"
+has "CHECK GREEN (full, 3 steps" "every step after a stdin reader still counts"
+# Durations: asserted present, never their value.
+matches() { printf '%s\n' "$out" | grep -qE -- "$1"; report $? "$2"; }
+conf 'compile [fast]: echo compile ran' 'unit: exit 3'
+check --fast
+matches '^<== compile \([0-9]+ s\)$' "each step reports its duration"
+matches '^CHECK GREEN \(fast, 1 steps, [0-9]+ s\)$' "the green line carries the total duration"
+check
+matches '^<== unit \([0-9]+ s\)$' "a failing step still reports its duration"
+mkdir -p "$TMP/nodate"; printf '#!/bin/sh\necho unknown\n' > "$TMP/nodate/date"; chmod +x "$TMP/nodate/date"
+run env PATH="$TMP/nodate:$PATH" sh "$C/scripts/check" --fast
+matches '^CHECK GREEN \(fast, 1 steps\)$' "no usable clock: times are left out, the run still counts"
+
+# Prerequisites (requires <step>: <command>): evaluated before step 1, once per distinct command.
+conf 'compile [fast]: echo compile ran' 'e2e: echo e2e ran'
+check
+hasnt "prerequisite" "no requires line → no prerequisite output (unchanged behavior)"
+conf 'compile [fast]: echo compile ran' 'unit [fast]: echo unit ran' 'e2e: echo e2e ran' \
+     'requires compile: echo met-output; true' 'requires e2e: echo miss""ing-runtime-text; exit 4'
+check
+exits 1 "unmet prerequisite fails check"
+hasnt "compile ran" "unmet prerequisite on the last step: not even the first step runs"
+hasnt "==>" "… no step marker at all";            hasnt "CHECK GREEN" "… and no green line"
+has "CHECK FAILED (full) prerequisite not met: echo miss\"\"ing-runtime-text; exit 4 (steps: e2e)" "failure names command and step"
+has "environment gap, see prompts/recovery/environment-gap.md (R-13)" "failure points at R-13"
+has "missing-runtime-text" "an unmet prerequisite shows its output"
+has "ok    prerequisite: echo met-output; true (steps: compile)" "a met prerequisite is one ok line"
+printf '%s\n' "$out" | grep -qx 'met-output'; [ $? -ne 0 ]; report $? "a met prerequisite's output is not printed"
+check --fast
+exits 0 "--fast ignores prerequisites of full-only steps"; has "CHECK GREEN (fast, 2 steps" "… and runs the fast steps"
+conf 'a: echo a ran' 'requires a: no-such-cmd-anew'
+check
+exits 1 "missing prerequisite command → not met";  has "not found" "… with the shell's error text"
+has "CHECK FAILED (full) prerequisite not met: no-such-cmd-anew" "… reported, check does not abort"
+conf 'a: echo a ran' 'requires b: true'
+check
+exits 1 "requires naming no step fails check";     has "requires names no step: b" "… and names it"
+: > "$TMP/req-count"
+conf 'a [fast]: true' 'b: true' 'c: true' "requires a: echo x >> '$TMP/req-count'" \
+     "requires b: echo x >> '$TMP/req-count'" "requires c: echo x >> '$TMP/req-count'"
+check
+exits 0 "shared prerequisite, met";                has "(steps: a, b, c)" "… listed once for all its steps"
+[ "$(wc -l < "$TMP/req-count" | tr -d ' ')" -eq 1 ]; report $? "a prerequisite on three steps runs once per check run"
+conf 'a: true' 'requires a: true' 'requires a: true'
+check;             has "ok    prerequisite: true (steps: a)" "the same requires line twice lists its step once"
+conf 'a: echo a ran' 'requires a:'
+check
+exits 1 "requires with an empty command fails check"; has "CHECK FAILED (full) requires has no command: a" "… and says so"
+hasnt "a ran" "… before any step"
+conf 'a: echo a ran' 'requires a: # runtime to be decided'
+check
+exits 1 "a comment-only prerequisite command fails check"; has "requires has no command: a" "… as no command"
+conf 'a: echo a ran' 'requires : true'
+check;             has "requires names no step: (empty)" "an empty step name is shown as (empty)"
+conf 'a: echo a ran' 'requires a'
+check
+exits 1 "requires line without ':' fails check";  has "requires line has no ':': requires a" "… as a conf error"
+hasnt "environment gap" "… not as an environment gap"
+printf 'requires\fx: echo ff ran\n' > "$C/scripts/check.conf"
+check;             has "ff ran" "only a space or tab after 'requires' makes a requires line (as in doctor and residue)"
+printf 'a: echo a ran\r\nrequires a: true\r\n' > "$C/scripts/check.conf"
+check
+exits 0 "CRLF conf with a requires line";         has "ok    prerequisite: true (steps: a)" "… pairs step and prerequisite"
+
+# --- scripts/residue: same bare copy. Assertions never require an idle machine: they look for
+# this run's own marker, so another process starting meanwhile cannot make them flaky.
+cp "$ROOT/scripts/residue" "$C/scripts/residue"
+residue() { run env ANEW_RESIDUE_SETTLE=1 ANEW_RESIDUE_MB=1000000 sh "$C/scripts/residue" "$@"; }
+LEAK=anew-residue-leak-$$
+
+echo "== scripts/residue =="
+residue --fsat
+exits 2 "residue: unknown argument";             has "usage:" "residue: prints usage"
+printf '# only a comment\n\n  # indented\n \r\n' > "$C/scripts/check.conf"
+residue
+exits 0 "residue: conf without steps";           has "RESIDUE NOT MEASURED (full)" "no steps → not measured, never clean"
+hasnt "baseline: " "no steps → nothing is measured"
+conf '# a prerequisite alone' 'requires unit: true'
+residue
+has "RESIDUE NOT MEASURED (full)" "residue: a requires line is not a step"
+printf 'requires\fx: true\n' > "$C/scripts/check.conf"
+residue
+hasnt "RESIDUE NOT MEASURED" "residue: only a space or tab after 'requires' makes a requires line (as in check)"
+conf 'unit [fast]: exit 3'
+residue
+exits 1 "residue: red check";                    has "RESIDUE TEST ABORTED (full): check failed in run 1" "red check aborts the residue test"
+conf "unit [fast]: sh -c 'sleep 1; :' $LEAK" "e2e: echo e2e ran"
+residue --fast
+has "baseline: " "residue: measures a baseline";   has "after run 2: " "residue: measures after both runs"
+has "==> run 2/2: ./scripts/check --fast" "residue --fast runs the fast profile twice"; hasnt "e2e ran" "residue --fast skips full-only steps"
+if printf '%s\n' "$out" | grep '^  survivor  ' | grep -qF "$LEAK"; then report 1 "a step that waits for its child leaves no survivor"
+else report 0 "a step that waits for its child leaves no survivor"; fi
+# The scenario processes below write their pid and are stopped afterwards: the selftest itself
+# leaves nothing running. Each one also ends on its own after ~30 s, should a kill miss it.
+LIVE='echo $$ >> "$1"; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done'
+conf "unit: echo unit ran" "server: sh -c '$LIVE' $LEAK '$TMP/leak.pid' >/dev/null 2>&1 &"
+residue
+kill $(cat "$TMP/leak.pid" 2>/dev/null) 2>/dev/null
+exits 1 "residue: leaked process";               has "RESIDUE FOUND (full)" "leak is reported"
+has "$LEAK" "the survivor is named with its command line"
+if printf '%s\n' "$out" | grep '^  survivor  ' | grep -F "$LEAK" | grep -qF '(parent '; then report 0 "the survivor names its parent"
+else report 1 "the survivor names its parent"; fi
+# A process started meanwhile by something outside check — here a watcher started before the
+# baseline, not an ancestor of the test — is not check's: listed with its parent, never failing.
+GO="$TMP/go"; FOREIGN_MARK=anew-residue-foreign-$$
+( while [ ! -f "$GO" ]; do sleep 1; done; sh -c "$LIVE" "$FOREIGN_MARK" "$TMP/foreign.pid" & wait ) &
+WATCH=$!
+conf "unit: touch '$GO' && sleep 3"
+residue
+kill "$WATCH" $(cat "$TMP/foreign.pid" 2>/dev/null) 2>/dev/null
+exits 0 "residue: a process from outside check does not fail it"; has "RESIDUE CLEAN (full, 2 runs)" "… the verdict is clean"
+if printf '%s\n' "$out" | grep '^  not from check  ' | grep -F "$FOREIGN_MARK" | grep -qF '(parent '; then report 0 "… and it is listed as not from check, with its parent"
+else report 1 "… and it is listed as not from check, with its parent"; fi
+# The POSIX path on any machine: a fake uname and ps (pid, ppid, args). After the baseline, a
+# kernel thread appears (never a survivor) and, on request, a zombie (always one), a process whose
+# parent is a live baseline process (not from check), and orphans: one handed to init, one whose
+# parent is a new process whose own parent is gone (both check's).
+mkdir -p "$TMP/fakeps"
+printf '#!/bin/sh\necho Linux\n' > "$TMP/fakeps/uname"
+cat > "$TMP/fakeps/ps" <<'EOF2'
+#!/bin/sh
+n=$(($(cat "$PSCOUNT" 2>/dev/null || echo 0) + 1)); echo "$n" > "$PSCOUNT"
+echo "    1     0 /sbin/init"
+echo "  100     1 /usr/bin/anew-other-session"
+[ "$n" -gt 2 ] || exit 0
+echo " 4242     2 [kworker/0:1-events]"
+[ -z "${ZOMBIE:-}" ] || echo " 4243     1 [anew-zombie] <defunct>"
+[ -z "${FOREIGN:-}" ] || echo " 4244   100 anew-foreign --flag"
+[ -z "${ORPHANS:-}" ] || { echo " 4245     1 anew-orphan"; echo " 4246  4247 anew-child"; echo " 4247  9999 anew-parent-gone"; }
+EOF2
+chmod +x "$TMP/fakeps/uname" "$TMP/fakeps/ps"
+conf 'unit [fast]: echo unit ran'
+fakeps() { rm -f "$TMP/fakeps/count"; run env PATH="$TMP/fakeps:$PATH" PSCOUNT="$TMP/fakeps/count" "$@" \
+             ANEW_RESIDUE_SETTLE=1 ANEW_RESIDUE_MB=1000000 sh "$C/scripts/residue" --fast; }
+fakeps
+exits 0 "residue: a kernel thread is not a survivor"; hasnt "kworker" "kernel threads are never listed"
+fakeps ZOMBIE=1
+exits 1 "residue: a zombie is a survivor";       has "[anew-zombie] <defunct>" "the zombie is named"
+fakeps FOREIGN=1
+exits 0 "residue: a child of a live baseline process is not check's"
+has "  not from check  4244  anew-foreign --flag  (parent 100 anew-other-session)" "… listed with its parent"
+has "0 survivor(s), 1 not from check" "… counted apart";  hasnt "  survivor  4244" "… never as a survivor"
+fakeps FOREIGN=1 ORPHANS=1
+exits 1 "residue: orphans are check's"
+has "  survivor  4245  anew-orphan  (parent 1 init)" "an orphan handed to init is a survivor"
+has "  survivor  4247  anew-parent-gone  (parent 9999 gone)" "a process whose parent is gone is a survivor"
+has "  survivor  4246  anew-child  (parent 4247 anew-parent-gone)" "a child of an orphan is a survivor too"
+has "  not from check  4244" "… while the other session's process stays not from check"
+# Memory is reported, never judged: a fake Darwin with vm_stat whose free pages halve after the
+# baseline drops ~3.9 GB, over a 512 MB tolerance, with nothing of check's left.
+mkdir -p "$TMP/fakemac"
+printf '#!/bin/sh\necho Darwin\n' > "$TMP/fakemac/uname"
+cat > "$TMP/fakemac/vm_stat" <<'EOF2'
+#!/bin/sh
+n=$(($(cat "$VMCOUNT" 2>/dev/null || echo 0) + 1)); echo "$n" > "$VMCOUNT"
+echo "Mach Virtual Memory Statistics: (page size of 4096 bytes)"
+if [ "$n" -gt 2 ]; then echo "Pages free:                     1000000."; else echo "Pages free:                     2000000."; fi
+EOF2
+cp "$TMP/fakeps/ps" "$TMP/fakemac/ps"
+chmod +x "$TMP/fakemac/uname" "$TMP/fakemac/vm_stat" "$TMP/fakemac/ps"
+rm -f "$TMP/fakemac/count" "$TMP/fakemac/vmcount"
+run env PATH="$TMP/fakemac:$PATH" PSCOUNT="$TMP/fakemac/count" VMCOUNT="$TMP/fakemac/vmcount" \
+  ANEW_RESIDUE_SETTLE=1 ANEW_RESIDUE_MB=512 sh "$C/scripts/residue" --fast
+exits 0 "residue: a memory drop alone does not fail it"
+has "over the 512 MB tolerance (informational" "… it is reported as informational"
+has "RESIDUE CLEAN (fast, 2 runs)" "… and the verdict is clean"
+# The Windows path on any machine: a fake uname, powershell.exe (pid, ppid, creation time, name,
+# command) and MSYS ps -el. Baseline: claude.exe 500; MSYS bash 550 (msys 50) and, under it, bash
+# 600 (msys 60) of another session. After the baseline 550 exits, so 600's MSYS parent becomes 1:
+# it must keep its identity (not new, not a survivor). On request: an orphan whose parent is gone
+# and one whose parent pid was reused by a younger process (check's), a native child of claude.exe
+# and an MSYS child (msys 90, a status letter before its PID) whose Windows parent id is a dead
+# exec stub while its MSYS parent is bash 600 (both not from check).
+mkdir -p "$TMP/fakewin"
+printf '#!/bin/sh\necho MINGW64_NT-10.0-19045\n' > "$TMP/fakewin/uname"
+cat > "$TMP/fakewin/powershell.exe" <<'EOF2'
+#!/bin/sh
+n=$(($(cat "$PSCOUNT" 2>/dev/null || echo 0) + 1)); echo "$n" > "$PSCOUNT"
+t=$(printf '\t')
+echo "MEM${t}8000"
+echo "4${t}0${t}${t}System${t}System"
+echo "500${t}4${t}20260101000000001${t}claude.exe${t}claude.exe"
+echo "960${t}4${t}20260101000000020${t}x.exe${t}x.exe reuser"
+[ "$n" -gt 2 ] || echo "550${t}500${t}20260101000000002${t}bash.exe${t}bash.exe"
+echo "600${t}550${t}20260101000000003${t}bash.exe${t}bash.exe other-session"
+[ "$n" -gt 2 ] || exit 0
+[ -z "${ORPHANS:-}" ] || { echo "700${t}777${t}20260101000000010${t}sleep.exe${t}sleep.exe anew-win-orphan"
+                           echo "950${t}960${t}20260101000000005${t}x.exe${t}x.exe anew-win-reused"; }
+[ -z "${NATIVE:-}" ] || echo "800${t}500${t}20260101000000011${t}dotnet.exe${t}dotnet.exe anew-win-foreign"
+[ -z "${OTHERS:-}" ] || { echo "800${t}500${t}20260101000000011${t}dotnet.exe${t}dotnet.exe anew-win-foreign"
+                          echo "900${t}901${t}20260101000000012${t}tail.exe${t}tail.exe anew-win-repaired"; }
+EOF2
+cat > "$TMP/fakewin/ps" <<'EOF2'
+#!/bin/sh
+[ -z "${NOPS:-}" ] || exit 1
+n=$(($(cat "$MSYSCOUNT" 2>/dev/null || echo 0) + 1)); echo "$n" > "$MSYSCOUNT"
+echo "      PID    PPID    PGID     WINPID   TTY         UID    STIME COMMAND"
+if [ "$n" -gt 2 ]; then
+  echo "       60       1      60        600  cons0     197609   Oct 28 /usr/bin/bash"
+  echo "S      90      60      90        900  cons0     197609 10:00:01 /usr/bin/tail"
+else
+  echo "       50       1      50        550  cons0     197609   Oct 28 /usr/bin/bash"
+  echo "       60      50      60        600  cons0     197609   Oct 28 /usr/bin/bash"
+fi
+EOF2
+chmod +x "$TMP/fakewin/uname" "$TMP/fakewin/powershell.exe" "$TMP/fakewin/ps"
+fakewin() { rm -f "$TMP/fakewin/count" "$TMP/fakewin/msyscount"
+            run env PATH="$TMP/fakewin:$PATH" PSCOUNT="$TMP/fakewin/count" MSYSCOUNT="$TMP/fakewin/msyscount" "$@" \
+              ANEW_RESIDUE_SETTLE=1 ANEW_RESIDUE_MB=1000000 sh "$C/scripts/residue" --fast; }
+fakewin
+exits 0 "residue (Windows): a process whose MSYS parent exits keeps its identity"; hasnt "  600  " "… and is never listed"
+fakewin OTHERS=1
+exits 0 "residue (Windows): processes from outside check do not fail it"
+has "  not from check  800  dotnet.exe anew-win-foreign  (parent 500 claude.exe)" "… a native child of a baseline process"
+has "  not from check  900  tail.exe anew-win-repaired  (parent 600 bash.exe)" "… an MSYS child behind a dead exec stub (status letter read past)"
+fakewin ORPHANS=1
+exits 1 "residue (Windows): orphans are check's"
+has "  survivor  700  sleep.exe anew-win-orphan  (parent 777 gone)" "… a process whose parent is gone"
+has "  survivor  950  x.exe anew-win-reused  (parent 960 gone)" "… a process whose parent pid was reused by a younger process"
+fakewin NOPS=1 NATIVE=1
+exits 0 "residue (Windows): no MSYS ps still measures"; has "  not from check  800" "… and still attributes"
+
+# --- scripts/doctor: a git-initialised copy of the ANEW core only, reset between scenarios ---
+# Only what doctor reads: no application code, and no real specs or plans (a project's own specs
+# would collide with the scenarios) — so the selftest behaves the same in the template and in
+# every bootstrapped project.
+W="$TMP/ws"
+mkdir -p "$W"
+( cd "$ROOT" && git ls-files --cached --others --exclude-standard ) \
+  | grep -E '^(AGENTS\.md|README\.md|\.anew-version|docs/|workflows/|prompts/|scripts/|adapters/|specs/(TEMPLATE[^/]*\.md|(active|done|plans)/README\.md|plans/TEMPLATE\.md)$)' \
+  | ( cd "$ROOT" && tar -cf - -T - ) | ( cd "$W" && tar -xf - )
+git -C "$W" init -q
+git -C "$W" config core.autocrlf false   # the fixture is throwaway: no line-ending conversion noise
+git -C "$W" config core.safecrlf false
+git -C "$W" add -A
+git -C "$W" -c user.name=selftest -c user.email=selftest@example.invalid commit -qm fixture
+BASE=$(git -C "$W" rev-parse HEAD)
+reset()  { git -C "$W" reset -q --hard "$BASE"; git -C "$W" clean -qfdx; }
+commit() { git -C "$W" add -A; git -C "$W" -c user.name=selftest -c user.email=selftest@example.invalid commit -qm "$1"; }
+put()    { mkdir -p "$(dirname "$W/$1")"; f=$1; shift; printf '%s\n' "$@" > "$W/$f"; }
+# CI's base-ref and event variables would point doctor at refs and a payload the fixture doesn't
+# have; doctor_pr <payload> sets the event payload on purpose.
+doctor() { run sh -c 'unset ANEW_BASE_REF GITHUB_BASE_REF GITHUB_EVENT_PATH; exec sh "$0" "$@"' "$W/scripts/doctor" "$@"; }
+doctor_pr() { run sh -c 'unset ANEW_BASE_REF GITHUB_BASE_REF; GITHUB_EVENT_PATH=$1; export GITHUB_EVENT_PATH; shift; exec sh "$0" "$@"' "$W/scripts/doctor" "$@"; }
+
+echo "== scripts/doctor =="
+doctor
+exits 0 "clean workspace";                        has "== result: 0 fail" "clean workspace has no failures"
+hasnt "repository clone" "clean workspace: no clone warning"; hasnt "evidence directory" "clean workspace: no evidence warning"
+
+reset; put scripts/check.conf '# step: commented out until code exists' '  # indented' '   '
+doctor;            has "WARN  scripts/check.conf has no steps" "a conf without steps is reported"
+put scripts/check.conf 'unit [fast]: echo unit ran'
+doctor;            hasnt "check.conf has no steps" "a conf with a step is fine"
+has "ok    verification contract configured" "… and reported as configured"
+hasnt "prerequisite" "no requires line → no prerequisite output";  hasnt "profile fast" "… and no profile verdict"
+put scripts/check.conf 'requires unit: true'
+doctor;            has "WARN  scripts/check.conf has no steps" "a requires line is not a step"
+
+# Prerequisites: reported per command and as a per-profile verdict; WARN in every mode.
+reset; put scripts/check.conf 'compile [fast]: true' 'e2e: true' 'requires compile: true' \
+  'requires e2e: echo runtime-miss""ing-text; exit 4'
+doctor;            exits 0 "unmet prerequisite only warns"
+has "ok    prerequisite met: true (steps: compile)" "a met prerequisite is an ok line naming its step"
+has "WARN  prerequisite not met: echo runtime-miss\"\"ing-text; exit 4 (steps: e2e)" "an unmet one is a WARN naming step and command"
+has "runtime-missing-text" "… with the command's output"
+has "ok    profile fast: runnable on this machine" "unmet on a full-only step: fast stays runnable"
+has "WARN  profile full: not runnable on this machine (steps: e2e)" "… full is not runnable, naming the step"
+doctor --strict;   exits 0 "unmet prerequisite under --strict still only warns"
+has "WARN  prerequisite not met" "… as a WARN, not a FAIL"
+put scripts/check.conf 'compile [fast]: true' 'e2e: true' 'requires compile: exit 1'
+doctor;            has "WARN  profile fast: not runnable on this machine (steps: compile)" "unmet on a fast step: fast not runnable"
+has "WARN  profile full: not runnable on this machine (steps: compile)" "… and full neither"
+put scripts/check.conf 'a: true' 'requires a: no-such-cmd-anew'
+doctor;            exits 0 "missing prerequisite command does not abort doctor"
+has "WARN  prerequisite not met: no-such-cmd-anew" "… it is reported as not met";  has "not found" "… with the shell's error text"
+put scripts/check.conf 'a: true' 'requires b: true'
+doctor;            has "WARN  check.conf: requires names no step: b" "a requires line naming no step is reported"
+has "WARN  profile full: check fails on the check.conf errors above" "… and no profile is called runnable"
+put scripts/check.conf 'a: true' 'requires a: # runtime to be decided'
+doctor;            has "WARN  check.conf: requires has no command: a" "a comment-only prerequisite command is a conf error"
+put scripts/check.conf 'a: true' 'requires : true'
+doctor;            has "requires names no step: (empty)" "an empty step name is shown as (empty)"
+: > "$TMP/doc-count"
+put scripts/check.conf 'a [fast]: true' 'b: true' 'c: true' "requires a: echo x >> '$TMP/doc-count'" \
+  "requires b: echo x >> '$TMP/doc-count'" "requires c: echo x >> '$TMP/doc-count'"
+doctor;            has "(steps: a, b, c)" "a shared prerequisite is listed once for all its steps"
+[ "$(wc -l < "$TMP/doc-count" | tr -d ' ')" -eq 1 ]; report $? "a prerequisite on three steps runs once per doctor run"
+put scripts/check.conf 'e2e: true' 'requires e2e: true' 'requires e2e: exit 1'
+doctor;            has "ok    prerequisite met: true (steps: e2e)" "one step, one met prerequisite: ok"
+has "WARN  prerequisite not met: exit 1 (steps: e2e)" "… and one unmet: WARN";  has "WARN  profile full: not runnable on this machine (steps: e2e)" "… the step is not runnable"
+put scripts/check.conf 'lint, format [fast]: true' 'e2e: true' 'requires lint, format: false'
+doctor;            has "WARN  profile fast: not runnable on this machine (steps: lint, format)" "a step name with ', ' keeps the verdict exact"
+put scripts/check.conf 'a\tb [fast]: true' 'requires a\tb: false'
+doctor;            has "WARN  profile fast: not runnable on this machine (steps: a\tb)" "a backslash in a step name keeps the verdict exact"
+put scripts/check.conf 'a: true' 'requires a:'
+doctor;            has "WARN  check.conf: requires has no command: a" "an empty prerequisite command is a conf error"
+has "WARN  profile full: check fails on the check.conf errors above" "… and no profile is called runnable"
+put scripts/check.conf 'a: true' 'requires a'
+doctor;            has "WARN  check.conf: requires line has no ':': requires a" "a requires line without ':' is a conf error"
+put scripts/check.conf 'a: true' 'requires a: true' 'requires a: true'
+doctor;            has "ok    prerequisite met: true (steps: a)" "the same requires line twice lists its step once"
+printf 'requires\fx: true\n' > "$W/scripts/check.conf"
+doctor;            hasnt "check.conf has no steps" "only a space or tab after 'requires' makes a requires line (as in check)"
+hasnt "profile fast" "… and no prerequisite verdict is printed for it"
+
+reset; put specs/plans/0001-plan.md '# Plan 0001' '- Approved by / on: —'
+doctor;            has "WARN  plan exists for unapproved spec 0001" "plan without a spec → WARN locally"
+doctor --strict;   exits 1 "plan without a spec under --strict"; has "FAIL  plan exists for unapproved spec 0001" "… FAIL under --strict"
+
+reset; put specs/active/0002-draft.md '# Spec 0002' '- Status: Draft'; put specs/plans/0002-plan.md '# Plan 0002' '- Approved by / on: —'
+doctor;            has "plan exists for unapproved spec 0002 (spec status: Draft)" "plan for a Draft spec is a gate violation"
+
+reset; put specs/active/0003-wip.md '# Spec 0003' '- Status: In progress'; put specs/plans/0003-plan.md '# Plan 0003' '- Approved by / on: —'
+doctor;            has "build started without recorded plan approval (spec 0003" "In progress without plan approval is caught"
+put specs/plans/0003-plan.md '# Plan 0003' '- Approved by / on: Ada, 2026-10-16'
+doctor;            hasnt "build started without recorded plan approval" "a recorded approval clears it"
+put specs/plans/0003-plan.md '# Plan 0003' '- Approved by / on: — <!-- This line IS the plan gate record: "<name>, <YYYY-MM-DD>", written' \
+  '  at the end of /plan on human approval. While it is empty ("—"), /build refuses to start. -->'
+doctor;            has "build started without recorded plan approval (spec 0003" "the template's untouched approval line (a comment spanning lines) is no approval"
+put specs/plans/0003-plan.md '# Plan 0003' '- Approved by / on: Ada, 2026-10-16 <!-- a note that' '  spans lines -->'
+doctor;            hasnt "build started without recorded plan approval" "a value before a comment that spans lines is an approval"
+put specs/plans/0003-plan.md '# Plan 0003' '- Approved by / on: Ada, 2026-10-16 <!-- a note -->'
+doctor;            hasnt "build started without recorded plan approval" "a value before a comment closed on the line is an approval"
+
+reset; put specs/done/0004-old.md '# Spec 0004' '- Status: Shipped'; commit "ship 0004"
+put specs/done/0004-old.md '# Spec 0004' '- Status: Shipped' 'edited after shipping'
+doctor --strict;   exits 1 "edited shipped spec under --strict"; has "shipped spec changed: specs/done/0004-old.md" "edit under specs/done/ is caught"
+
+reset; put specs/active/0005-a.md '# Spec 0005' '- Status: Draft'; put specs/done/0005-b.md '# Spec 0005' '- Status: Shipped'
+doctor;            has "duplicate spec number 0005" "twin spec numbers are caught"
+
+reset; put specs/done/0006-c.md '# Spec 0006' '- Status: Approved'
+doctor;            has "specs/done/0006-c.md is not marked 'Status: Shipped'" "unmarked shipped spec is caught"
+
+# Self-critique status: pending on a Draft warns; past approval it is a gate.
+reset; put specs/active/0030-sc.md '# Spec 0030' '- Status: Draft' '- Self-critique: pending (after 0029 ships)'
+doctor;            has "WARN  self-critique pending (after 0029 ships): specs/active/0030-sc.md" "pending self-critique on a Draft → WARN with its condition"
+put specs/active/0030-sc.md '# Spec 0030' '- Status: Approved' '- Self-critique: pending (after 0029 ships)'
+doctor --strict;   exits 1 "pending self-critique on an Approved spec under --strict"
+has "FAIL  self-critique still pending (after 0029 ships) on a spec past approval" "… is a gate"
+put specs/active/0030-sc.md '# Spec 0030' '- Status: In progress' '- Self-critique: pending (x)'
+doctor;            has "WARN  self-critique still pending (x) on a spec past approval" "… In progress too (WARN locally)"
+put specs/active/0030-sc.md '# Spec 0030' '- Status: Approved' '- Self-critique: Pending (y)'
+doctor;            has "self-critique still Pending (y) on a spec past approval" "the pending status in any case"
+put specs/active/0030-sc.md '# Spec 0030' '- Status: Approved' '- Self-critique: done'
+doctor;            hasnt "self-critique" "self-critique done → no line"
+put specs/active/0030-sc.md '# Spec 0030' '- Status: Approved'
+doctor;            hasnt "self-critique" "no Self-critique field (older spec) → no line"
+
+# Criterion ↔ test map: every backticked name in an active plan must be held by a file outside
+# specs/ (path, basename or text); WARN only; shipped plans are not scanned.
+reset
+rm -f "$W/scripts/selftest"   # its own text holds every name below
+put specs/active/0040-map.md '# Spec 0040' '- Status: In progress' 'mentions test_only_in_spec'
+put specs/plans/0040-plan.md '# Plan 0040' '- Approved by / on: Ada, 2026-11-02' '' '## Criterion ↔ test map' \
+  '| Acceptance criterion | Proven by | Profile |' '|---|---|---|' \
+  '| AC-1 | `test_present_one`; `tests/unit/sample_test.txt::test_in_file`; `sample_test.txt` | fast |' \
+  '| AC-2 | `test_wild_*`; `test_param[a-b]`; `test_only_in_spec` | fast |' \
+  '| AC-3 | `test_absent_name`; `tests/unit/sample_test.txt::test_not_in_file`; `nomatch_*`; `specs/active/0040-map.md` | fast |' \
+  '' '## Build evidence' '| AC-9 | `test_outside_the_map` | fast |'
+put tests/unit/sample_test.txt 'def test_present_one(): ...' 'def test_in_file(): ...' 'def test_wild_card(): ...' 'def test_param(): ...'
+put specs/done/0041-old.md '# Spec 0041' '- Status: Shipped'
+put specs/plans/0041-plan.md '# Plan 0041' '- Approved by / on: Ada, 2026-10-01' '## Criterion ↔ test map' \
+  '| Acceptance criterion | Proven by | Profile |' '|---|---|---|' '| AC-1 | `test_renamed_since` | fast |'
+doctor
+has "WARN  plan 0040: criterion map names \`test_absent_name\` — no file holds it" "a map name no file holds → WARN"
+has "names \`tests/unit/sample_test.txt::test_not_in_file\`" "… a missing part of a::b → WARN"
+has "names \`nomatch_*\`" "… a wildcard prefix no file holds → WARN"
+has "names \`test_only_in_spec\`" "… a name found only under specs/ → WARN"
+has "names \`specs/active/0040-map.md\`" "… a path under specs/ → WARN"
+hasnt "\`test_present_one\`" "a name in an untracked test file is held"
+hasnt "\`tests/unit/sample_test.txt::test_in_file\`" "a path::name with both parts held is fine"
+hasnt "\`sample_test.txt\`" "a basename is held"
+hasnt "\`test_wild_*\`" "a wildcard is cut to its prefix"
+hasnt "\`test_param[a-b]\`" "a [param] is cut off"
+hasnt "test_outside_the_map" "a table outside the map section is not scanned"
+hasnt "test_renamed_since" "a shipped plan is not scanned"
+has "ok    criterion maps checked (10 name(s))" "the scan reports how many names it checked"
+doctor --strict;   exits 0 "a missing map name stays a WARN under --strict"
+NG="$TMP/no[git]*"   # glob characters in ROOT are never a pattern
+rm -rf "$NG"; cp -R "$W" "$NG"; rm -rf "$NG/.git"
+run env GIT_CEILING_DIRECTORIES="$TMP" sh "$NG/scripts/doctor"   # no outer repo either
+has "names \`test_absent_name\`" "without git: a missing name → WARN"
+hasnt "\`test_present_one\`" "without git: a name in a file is held"
+hasnt "\`sample_test.txt\`" "without git: a basename is held"
+has "names \`test_only_in_spec\`" "without git: specs/ still does not count"
+has "names \`specs/active/0040-map.md\`" "without git: a path under specs/ is not held"
+rm -rf "$NG"
+put .gitignore 'ignored/'; put ignored/x.txt 'test_absent_name'
+doctor;            has "names \`test_absent_name\`" "a git-ignored file does not hold a name"
+
+# New ships (vs the base ref): every criterion checked, or moved out at the ship gate with a target.
+doctor_base() { run sh -c 'unset GITHUB_BASE_REF GITHUB_EVENT_PATH; ANEW_BASE_REF=$1; export ANEW_BASE_REF; shift; exec sh "$0" "$@"' "$W/scripts/doctor" "$@"; }
+reset; put specs/done/0020-new.md '# Spec 0020' '- Status: Shipped' '- [x] AC-1 — proven' '- [ ] AC-2 — unproven'
+doctor;            has "WARN  unchecked criterion in a new ship: specs/done/0020-new.md AC-2" "an uncommitted new ship with an unproven criterion → WARN"
+hasnt "0020-new.md AC-1" "… a checked criterion is fine"
+commit "ship 0020"
+doctor_base "$BASE" --strict
+exits 1 "new ship with an unproven criterion under --strict"; has "FAIL  unchecked criterion in a new ship: specs/done/0020-new.md AC-2" "… FAIL, naming spec and criterion"
+doctor;            hasnt "criterion in a new ship" "a spec already shipped at the base is not judged again"
+reset; put specs/done/0021-mini.md '# Spec 0021 (mini)' '- Status: Shipped' '- [x] CB-1 — done' '- [ ] PB-1 — not proven'
+doctor;            has "unchecked criterion in a new ship: specs/done/0021-mini.md PB-1" "mini-spec CB-/PB- lines are judged too"
+reset; put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] ~~AC-1 — c~~ → moved to B-3 — Ada, 2026-10-29, needs a newer runtime'
+doctor;            has "moved criterion has no backlog entry: specs/done/0022-move.md AC-1 → B-3" "a move to a backlog entry that does not exist → gate"
+put specs/backlog.md '# Backlog' '- **B-3** — needs a newer runtime'
+doctor;            hasnt "0022-move.md" "a move to an existing backlog entry is accepted"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] AC-1 — c -> moved to B-3 — Ada, 2026-10-29'
+doctor;            hasnt "0022-move.md" "the ASCII arrow is accepted too"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] ~~AC-1 — c~~'
+doctor;            has "unchecked criterion in a new ship: specs/done/0022-move.md AC-1" "striking a criterion through without a target does not move it"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] AC-1 — c → moved to spec 0007'
+doctor;            has "moved criterion has no open target spec: specs/done/0022-move.md AC-1 → spec 0007" "a move to a spec that does not exist → gate"
+put specs/active/0007-later.md '# Spec 0007' '- Status: Draft'
+doctor;            hasnt "0022-move.md" "a move to an existing spec is accepted"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' 'Sensitive area: payments' '- [ ] AC-1 — c → moved to spec 0007'
+doctor;            has "a sensitive-area criterion cannot be moved out: specs/done/0022-move.md AC-1" "a sensitive-area criterion is never moved out"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- Sensitive area: none' '- [ ] AC-1 — c → moved to spec 0007'
+doctor;            hasnt "0022-move.md" "'Sensitive area: none' is not a sensitive area"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' 'This is not a Sensitive area: just prose.' '- [ ] AC-1 — c → moved to spec 0007'
+doctor;            hasnt "0022-move.md" "prose mentioning a sensitive area is not a declaration"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- sensitive areas: payments' '- [ ] AC-1 — c → moved to spec 0007'
+doctor;            has "a sensitive-area criterion cannot be moved out: specs/done/0022-move.md AC-1" "'Sensitive areas:' in any case is a declaration"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] AC-1 — c → moved to foo'
+doctor;            has "moved criterion has no target: specs/done/0022-move.md AC-1" "an unknown move target → gate"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] AC-1 — c → moved to spec 0022'
+doctor;            has "moved criterion targets its own spec: specs/done/0022-move.md AC-1" "a spec cannot move a criterion to itself"
+put specs/done/0005-old.md '# Spec 0005' '- Status: Shipped' '- [x] AC-1 — ok'
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] AC-1 — c → moved to spec 0005'
+doctor;            has "moved criterion has no open target spec: specs/done/0022-move.md AC-1 → spec 0005" "a shipped spec is no target (moved work stays open)"
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] AC-1 — doctor rejects a line without `→ moved to B-3` marker'
+doctor;            has "unchecked criterion in a new ship: specs/done/0022-move.md AC-1" "a marker in backticks is quoted text, not a move"
+put specs/backlog.md '# Backlog' '- B-4 — bare id, not an entry'
+put specs/done/0022-move.md '# Spec 0022' '- Status: Shipped' '- [ ] ~~AC-1 — c~~ → moved to B-4'
+doctor;            has "moved criterion has no backlog entry: specs/done/0022-move.md AC-1 → B-4" "a backlog entry is **B-<n>**, not a bare mention"
+reset; put specs/done/0023-md.md '# Spec 0023' '- Status: Shipped' '* [ ] AC-1 — star bullet' '1. [ ] **AC-2** — numbered, bold' '- [X] AC-3 — capital X is ticked'
+doctor;            has "unchecked criterion in a new ship: specs/done/0023-md.md AC-1 —" "a '*' bullet criterion is judged (exact id)"
+has "unchecked criterion in a new ship: specs/done/0023-md.md AC-2" "a numbered, bold criterion is judged";  hasnt "0023-md.md AC-3" "[X] counts as ticked"
+reset; put specs/done/0032-fc.md '# Spec 0032' '- Status: Shipped' '1) [ ] AC-1 — paren list' '- []AC-2 — empty box' '| AC-3 | evidence row, no box |' '- [x] **AC-4** — ticked'
+doctor;            has "unchecked criterion in a new ship: specs/done/0032-fc.md AC-1 —" "fail closed: a '1)' list criterion is judged"
+has "unchecked criterion in a new ship: specs/done/0032-fc.md AC-2 —" "… an empty box is unchecked"
+hasnt "0032-fc.md AC-3" "… a line without a checkbox (evidence table) is not a criterion";  hasnt "0032-fc.md AC-4" "… a ticked one is fine"
+put specs/backlog.md '# Backlog' '- **B-3** — x'
+put specs/done/0032-fc.md '# Spec 0032' '- Status: Shipped' '- [ ] AC-1 — c → moved to B-3 — Ada, 2026-10-29, was ~~B-2~~'
+doctor;            hasnt "0032-fc.md" "a ~~ after the marker does not hide the move"
+put specs/active/0007-later.md '# Spec 0007' '- Status: Draft'
+for decl in '- **Sensitive area:** payments' '* Sensitive area: payments' '__Sensitive areas__: payments'; do
+  put specs/done/0032-fc.md '# Spec 0032' '- Status: Shipped' "$decl" '- [ ] AC-1 — c → moved to spec 0007'
+  doctor;          has "a sensitive-area criterion cannot be moved out: specs/done/0032-fc.md AC-1" "sensitive declared as '$decl' blocks a move"
+done
+for decl in '- Sensitive area: None — docs only' '- Sensitive area: n/a'; do
+  put specs/done/0032-fc.md '# Spec 0032' '- Status: Shipped' "$decl" '- [ ] AC-1 — c → moved to spec 0007'
+  doctor;          hasnt "0032-fc.md" "'$decl' is not sensitive"
+done
+reset; put specs/done/0034-first.md '# Spec 0034' '- Status: Shipped' '- [ ] AC-2 — unproven, depends on [x] AC-1' '- [ ] AC-3 — a ship shows `- [x] AC-1` lines' '- [x] AC-4 — proven; see [ ] AC-9'
+doctor;            has "unchecked criterion in a new ship: specs/done/0034-first.md AC-2 —" "a [x] AC-n inside the text does not tick the criterion"
+has "unchecked criterion in a new ship: specs/done/0034-first.md AC-3 —" "… nor in backticks";  hasnt "0034-first.md AC-9" "the first box and id decide (a ticked line is not judged by a later box)"
+hasnt "0034-first.md AC-1" "… and the id is the first one on the line"
+put specs/active/0007-later.md '# Spec 0007' '- Status: Draft'
+for decl in '- Sensitive area(s): none' '- Sensitive area — none' '- Sensitive area: `none`' '- Sensitive area: (none)' 'Sensitive areas are not touched by this change.'; do
+  put specs/done/0034-first.md '# Spec 0034' '- Status: Shipped' "$decl" '- [ ] AC-1 — c → moved to spec 0007'
+  doctor;          hasnt "0034-first.md" "'$decl' does not make the spec sensitive"
+done
+for decl in '- Sensitive area:' '1) Sensitive area: payments' '- Sensitive area: nonexistent-flag'; do
+  put specs/done/0034-first.md '# Spec 0034' '- Status: Shipped' "$decl" '- [ ] AC-1 — c → moved to spec 0007'
+  doctor;          has "a sensitive-area criterion cannot be moved out: specs/done/0034-first.md AC-1" "'$decl' makes the spec sensitive (fail closed)"
+done
+put specs/backlog.md '# Backlog' '- **B-3** — x'
+put specs/done/0034-first.md '# Spec 0034' '- Status: Shipped' '- [ ] ~~AC-1 — c~~ → moved to B-3'
+doctor;            hasnt "0034-first.md" "a struck id is cut at its closing ~~, the marker after it counts"
+put specs/done/0034-first.md '# Spec 0034' '- Status: Shipped' '- [ ] ~~AC-1 — → moved to B-3 inside the strike~~ no marker after'
+doctor;            has "unchecked criterion in a new ship: specs/done/0034-first.md AC-1 —" "… a marker inside the struck text does not count"
+reset; put "specs/done/0035-ödeme.md" '# Spec 0035' '- Status: Shipped' '- [x] AC-1 — ok'; commit "ship 0035"
+put "specs/done/0035-ödeme.md" '# Spec 0035' '- Status: Shipped' '- [x] AC-1 — ok' 'edited'
+doctor;            has "shipped spec changed: specs/done/0035-ödeme.md" "immutability names a non-ASCII spec unquoted"
+reset; put specs/done/0033-old.md '# Spec 0033' '- Status: Shipped' '- [ ] AC-1 — old, unchecked'; commit "ship 0033"
+put specs/done/0033-old.md '# Spec 0033' '- Status: Shipped' '- [ ] AC-1 — old, unchecked' 'edited'
+doctor;            has "shipped spec changed: specs/done/0033-old.md" "an edited shipped spec is an immutability gate"
+hasnt "criterion in a new ship" "… and never judged as a new ship"
+reset; put specs/done/0024-none.md '# Spec 0024' '- Status: Shipped' 'criteria lost in an edit'
+doctor;            has "WARN  new ship has no criterion line: specs/done/0024-none.md" "a new ship with no criterion line warns"
+reset; put "specs/done/0025-ödeme.md" '# Spec 0025' '- Status: Shipped' '- [ ] AC-1 — x'
+doctor;            has "unchecked criterion in a new ship: specs/done/0025-ödeme.md AC-1" "a non-ASCII spec name is judged (untracked)"
+git -C "$W" add -A
+doctor;            has "unchecked criterion in a new ship: specs/done/0025-ödeme.md AC-1" "… and staged"
+reset; printf '# Spec 0026\n- Status: Shipped\n- [ ] AC-1 \377 latin-1 byte\n' > "$W/specs/done/0026-enc.md"
+run env LC_ALL=C.UTF-8 sh -c 'unset ANEW_BASE_REF GITHUB_BASE_REF GITHUB_EVENT_PATH; exec sh "$0"' "$W/scripts/doctor"
+has "unchecked criterion in a new ship: specs/done/0026-enc.md AC-1 —" "a spec with a non-UTF-8 byte is read, its id exact (UTF-8 locale)"
+put specs/backlog.md '# Backlog' '- **B-3** — x'
+printf '# Spec 0026\n- Status: Shipped\n- [ ] ~~AC-1 caf\351~~ \342\206\222 moved to B-3 \342\200\224 Ada\n' > "$W/specs/done/0026-enc.md"
+run env LC_ALL=C.UTF-8 sh -c 'unset ANEW_BASE_REF GITHUB_BASE_REF GITHUB_EVENT_PATH; exec sh "$0"' "$W/scripts/doctor"
+hasnt "0026-enc.md" "a valid move in a Latin-1 spec is accepted under a UTF-8 locale"
+printf '# Spec 0026\n- Status: Shipped\n- [ ] AC-1 caf\351 \342\206\222 moved to B-3 \342\200\224 Ada\n' > "$W/specs/done/0026-enc.md"
+run env LC_ALL=C.UTF-8 sh -c 'unset ANEW_BASE_REF GITHUB_BASE_REF GITHUB_EVENT_PATH; exec sh "$0"' "$W/scripts/doctor"
+hasnt "0026-enc.md" "… also with the Latin-1 byte outside a strike (bytes, not characters)"
+reset; put specs/done/0027-mini.md '# Spec 0027 (mini)' '- Status: Shipped' '- [x] CB-1 — ok' '- [ ] CB-2 — not proven'
+doctor;            has "unchecked criterion in a new ship: specs/done/0027-mini.md CB-2" "an unchecked CB- line is judged"
+# Base refs: an old ship next to a new one; the active → done move; the PR merge-base path.
+reset; put specs/done/0028-old.md '# Spec 0028' '- Status: Shipped' '- [ ] AC-1 — old, unchecked'; commit "ship 0028"
+OLD=$(git -C "$W" rev-parse HEAD)
+put specs/active/0029-new.md '# Spec 0029' '- Status: In progress' '- [ ] AC-1 — new, unchecked'; commit "work 0029"
+git -C "$W" mv specs/active/0029-new.md specs/done/0029-new.md; commit "ship 0029"
+doctor_base "$OLD"
+has "unchecked criterion in a new ship: specs/done/0029-new.md AC-1" "a committed active → done move is a new ship vs the base"
+hasnt "0028-old.md" "… a spec already shipped at the base is not judged next to it"
+git -C "$W" update-ref refs/remotes/origin/main "$OLD"
+run sh -c 'unset ANEW_BASE_REF GITHUB_EVENT_PATH; GITHUB_BASE_REF=main; export GITHUB_BASE_REF; exec sh "$0" --strict' "$W/scripts/doctor"
+exits 1 "PR base (GITHUB_BASE_REF): the new ship fails under --strict"
+has "FAIL  unchecked criterion in a new ship: specs/done/0029-new.md AC-1" "… seen through the merge-base"
+git -C "$W" update-ref -d refs/remotes/origin/main
+# A workspace in a subdirectory of its repository: paths are workspace-relative.
+reset; S="$TMP/sub"; mkdir -p "$S/ws"
+( cd "$W" && tar -cf - --exclude=.git . ) | ( cd "$S/ws" && tar -xf - )
+git -C "$S" init -q; git -C "$S" add -A
+git -C "$S" -c user.name=selftest -c user.email=selftest@example.invalid commit -qm fixture
+mkdir -p "$S/ws/specs/done"; printf '%s\n' '# Spec 0031' '- Status: Shipped' '- [ ] AC-1 — x' > "$S/ws/specs/done/0031-sub.md"
+git -C "$S" add -A; git -C "$S" -c user.name=selftest -c user.email=selftest@example.invalid commit -qm ship
+run sh -c 'unset GITHUB_BASE_REF GITHUB_EVENT_PATH; ANEW_BASE_REF=HEAD~1; export ANEW_BASE_REF; exec sh "$0"' "$S/ws/scripts/doctor"
+has "unchecked criterion in a new ship: specs/done/0031-sub.md AC-1" "a workspace in a subdirectory of its repo sees a committed new ship"
+printf '%s\n' '# Spec 0031' '- Status: Shipped' '- [ ] AC-1 — x' 'edited' > "$S/ws/specs/done/0031-sub.md"
+run sh -c 'unset GITHUB_BASE_REF GITHUB_EVENT_PATH ANEW_BASE_REF; exec sh "$0"' "$S/ws/scripts/doctor"
+has "shipped spec changed: specs/done/0031-sub.md" "immutability names the spec workspace-relative in a subdirectory"
+
+reset; put specs/done/0010-fast.md '# Spec 0010' '- Status: Shipped' '| AC-1 | CHECK GREEN (fast, 2 steps, 4 s) |'
+doctor;            exits 0 "fast evidence only warns"; has "WARN  fast output cited as evidence: specs/done/0010-fast.md" "a shipped spec citing only fast output is reported"
+put specs/done/0010-fast.md '# Spec 0010' '- Status: Shipped' '| AC-1 | CHECK GREEN (fast, 2 steps, 4 s) · CHECK GREEN (full, 5 steps, 90 s) |'
+doctor;            hasnt "fast output cited as evidence" "fast output next to full output is fine"
+put specs/done/0010-fast.md '# Spec 0010' '- Status: Shipped' '| AC-1 | CHECK GREEN (fast = full: no steps tagged fast, 2 steps) |'
+doctor;            hasnt "fast output cited as evidence" "an untagged conf's --fast run is a full run"
+reset; printf '{"action":"opened","pull_request":{"body":"Evidence: CHECK GREEN (fast, 3 steps, 9 s)"}}\n' > "$TMP/pr.json"
+doctor_pr "$TMP/pr.json"; has "WARN  fast output cited as evidence: the pull request description" "a PR citing only fast output is reported (CI)"
+printf '{"action":"opened","pull_request":{"body":"Evidence: CHECK GREEN (full, 9 steps, 300 s)"}}\n' > "$TMP/pr.json"
+doctor_pr "$TMP/pr.json"; hasnt "fast output cited as evidence" "a PR citing full output is fine"
+
+reset; put specs/active/0007-mini.md '# Spec 0007 (mini)' '- Status: Draft' '- Source:' '## Preserved behavior'
+doctor;            has "mini-spec 0007 has no Source work item" "mini-spec without Source is caught"
+
+reset; put specs/active/0008-x.md '# Spec 0008' '- Status: Draft' '- Source: WI-1'; put specs/active/0009-y.md '# Spec 0009' '- Status: Draft' '- Source: WI-1'
+doctor;            has "two open specs share Source 'WI-1'" "twin change requests are caught"
+
+reset; mkdir -p "$W/evidence/demo-clone/.git" "$W/evidence/demo-clone/evidence" "$W/.evidence" "$W/vendor/sub"
+printf 'gitdir: ../.git/modules/sub\n' > "$W/vendor/sub/.git"
+doctor
+exits 0 "evidence hygiene never fails";           has "repository clone inside the working tree: evidence/demo-clone" "nested clone is reported"
+has "evidence directory found: evidence " "evidence/ is reported";  has "evidence directory found: .evidence " ".evidence/ is reported"
+hasnt "evidence/demo-clone/evidence" "nothing inside a clone is reported twice"
+hasnt "clone inside the working tree: vendor/sub" "a .git FILE (submodule, worktree) is not a clone"
+
+if [ -f "$W/adapters/cursor/commands/plan.md" ]; then
+  reset; rm -f "$W/adapters/cursor/commands/plan.md"
+  doctor;          exits 1 "adapter parity broken"; has "FAIL  adapter parity: plan missing in cursor" "missing adapter command is a failure"
+  reset; rm -rf "$W/adapters/codex/skills/plan"
+  doctor;          exits 1 "codex parity broken"; has "FAIL  adapter parity: plan missing in codex" "missing codex skill is a failure"
+  reset; rm -f "$W/adapters/codex/skills/plan/agents/openai.yaml"
+  doctor;          has "FAIL  adapter parity: codex skill plan is not explicit-only" "a codex skill Codex could start by itself is a failure"
+  reset; doctor;   hasnt "missing in codex" "restored codex adapter is clean"
+else
+  echo "skip  adapter parity (no adapters/ in this repo)"
+fi
+
+if [ -f "$W/adapters/claude-code/.claude/commands/plan.md" ]; then
+  reset; sed '/^### `\/plan`$/d' "$W/docs/commands.md" > "$W/docs/commands.md.tmp" && mv "$W/docs/commands.md.tmp" "$W/docs/commands.md"
+  doctor;          exits 1 "command reference drift"; has "FAIL  command reference out of date: /plan missing from docs/commands.md" "a removed command section is a failure"
+  reset; doctor;   hasnt "command reference out of date" "restored reference is clean"
+else
+  echo "skip  command reference drift (no adapters/ in this repo)"
+fi
+
+if [ -f "$W/.anew-version" ]; then
+  reset; doctor;   has "ok    ANEW base version: $(head -n 1 "$W/.anew-version" | tr -d '\r')" "doctor reports the ANEW base version"
+  rm -f "$W/.anew-version"
+  doctor;          exits 0 "missing .anew-version only warns"; has "WARN  .anew-version missing" "a missing version marker is reported"
+fi
+# The template itself (unconfigured AGENTS.md): the marker must match the newest CHANGELOG entry.
+if grep -q 'STATUS: NOT CONFIGURED' "$ROOT/AGENTS.md" 2>/dev/null && [ -f "$ROOT/CHANGELOG.md" ]; then
+  out="changelog: $(sed -n 's/^## \(v[0-9][0-9.]*\) .*/\1/p' "$ROOT/CHANGELOG.md" | head -n 1) · .anew-version: $(head -n 1 "$ROOT/.anew-version" 2>/dev/null | tr -d '\r')"
+  [ "${out%% ·*}" = "changelog: ${out##*.anew-version: }" ]; report $? "template: .anew-version matches the newest CHANGELOG entry"
+fi
+
+reset; rm -f "$W/docs/testing.md"
+doctor;            exits 1 "core file missing"; has "FAIL  missing: docs/testing.md" "missing core file is a failure"
+
+# --- scripts/status: the same git-initialised copy, one fixture spec (and plan) per scenario ---
+status() { run sh "$W/scripts/status" "$@"; }
+mkspec() { put "specs/active/$1-demo.md" "# Spec $1 — demo" "" "- Status: $2" "- Mode: lite" \
+  "- Plan: \`specs/plans/$1-plan.md\`" "- Self-critique: done" "" "## Intent" "Demo intent." "" \
+  "## Requirements" "1. It works." "" "## Acceptance criteria" "- [ ] AC-1 — it works"; }
+mkplan() { n=$1; a=$2; shift 2; put "specs/plans/$n-plan.md" "# Plan $n — demo" "" \
+  "- Spec: \`specs/active/$n-demo.md\`" "- Status: Approved" "- Approved by / on: $a" "" \
+  "## Files to change or add" "- app.txt" "" "## Ordered steps" "1. Write app.txt." "" \
+  "## Build evidence" "$@"; }
+GREEN="- CHECK GREEN (full, 1 steps, 1 s) @$BASE"
+
+echo "== scripts/status =="
+reset; status
+exits 0 "status: empty workspace";                has "no work yet — start with /new-feature or /analyze" "status: empty state is named"
+reset; mkspec 0001 Draft; status
+has "0001  demo  spec: Draft · plan: —  →  ANALYZE (human)" "status: Draft → ANALYZE, human"
+reset; mkspec 0001 Approved; status
+has "→  PLAN (Developer)" "status: approved spec without plan → PLAN, Developer"
+mkplan 0001 "—"; status
+has "plan: Approved  →  PLAN (human)" "status: plan without approval → the human approves it"
+mkplan 0001 "selftest, 2026-01-01"; status
+has "→  BUILD (Developer)" "status: approved plan, spec not started → BUILD";  has "next: /build" "… next is /build"
+mkspec 0001 "In progress"; status
+has "finish the plan's steps" "status: in progress without evidence → BUILD continues"
+mkplan 0001 "selftest, 2026-01-01" '<!-- CHECK GREEN (full, 1 steps, 1 s) @abc1234 -->'; status
+has "finish the plan's steps" "status: an evidence line inside an HTML comment is not evidence"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN"; status
+has "→  REVIEW (fresh session / read-only reviewer)" "status: full evidence, no triage → REVIEW"
+has "a review writes no file" "… and says it cannot tell whether the review ran"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| M-1 Medium | real | fix-1 |" "| L-2 Low | noise | rationale |"
+commit "triage"; status
+has "→  FIX ROUND (Developer)" "status: a real finding with no fix commit after its round → FIX ROUND"
+has "[plan 0001/fix-k]" "… next names the fix commit label"
+put app.txt fixed; commit "fix: m-1 [plan 0001/fix-1]"; status
+has "→  REVIEW (fresh session / read-only reviewer)" "status: a fixed round with a real Medium finding → REVIEW again"
+has "re-review the fix diff of 'Review round 1" "… on the fix diff, as segments.md says"
+printf '%s\n' "" "### Review round 2 — selftest, 2026-01-02 (clean)" >> "$W/specs/plans/0001-plan.md"; status
+has "→  VERIFY (QA)" "status: a clean re-review recorded as a heading with no rows → VERIFY"
+git -C "$W" checkout -q -- specs/plans/0001-plan.md
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| M-1 Medium | real | fix-1 |" "| M-2 Medium | real | |"; status
+has "→  FIX ROUND (Developer)" "status: one fix commit does not close a second real finding"
+has "findings of 'Review round 1 — selftest, 2026-01-01' (M-2)" "… and the open one is named"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| M-1 Medium | real | fix-1 |" "| M-2 Medium | real | fix-2 |"; status
+has "(M-2): commits labeled" "status: a fix-<k> with no [plan NNNN/fix-<k>] commit stays open"
+reset; mkspec 0001 "In progress"; put app.txt fixed; commit "fix: l-1 [plan 0001/fix-1]"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-1 Low | real | fix-1 |"; status
+has "→  VERIFY (QA)" "status: a table written after its fix commits, Low only → VERIFY"
+commit "triage"; status
+has "→  VERIFY (QA)" "status: … and once that table is committed"
+reset; mkspec 0001 "In progress"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-1 Low | real | fix-1 |"
+put app.txt fixed; commit "fix: l-1 [plan 0001/fix-1], table in the same commit"; status
+has "→  VERIFY (QA)" "status: a table committed together with its fix"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-1 Low | real | fixed in $(git -C "$W" rev-parse --short HEAD) |" \
+  "| I-2 Info | real | done |"; status
+has "findings of 'Review round 1 — selftest, 2026-01-01' (I-2)" "status: a fix commit's sha closes a finding, other words do not"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-1 Low | real | introduced in $(git -C "$W" rev-parse --short "$BASE"); not fixed yet |"; status
+has "→  FIX ROUND (Developer)" "status: a sha cited as background (no [plan NNNN/fix- label) closes nothing"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| V-1 — the info banner hides Save; Medium | real | fix-1 |"; status
+has "unclear: the severity of V-1" "status: a severity word deep in the text is not read as the severity"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| 1 — the button is grey | real | fix-1 |"; status
+has "unclear: the severity of 1 in 'Review round 1" "status: a severity status cannot read is unclear"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-2 Low | noise | rationale |" "" \
+  "### VERIFY round 1 — selftest, 2026-01-02" "| Finding | Verdict | Note |" "|---|---|---|" "| F-1 Low | real | fix-1 |"; status
+has "→  VERIFY (QA)" "status: a VERIFY round with its Low findings fixed → VERIFY again"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-2 Low | noise | rationale |" "" \
+  "### Verify round 1 — selftest, 2026-01-02" "| Finding | Verdict | Note |" "|---|---|---|" "| F-1 Low | real | |"; status
+has "→  FIX ROUND (Developer)" "status: triage headings are read in any case"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Notes from the call" "| Finding | Verdict | Note |"; status
+has "unclear: 'Notes from the call' under ## Triage is neither" "status: an unknown heading under Triage is unclear"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-2 Low | noise | rationale |"; status
+has "→  VERIFY (QA)" "status: a review round without real findings → VERIFY"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-2 Low | noise | rationale |" "" \
+  "### VERIFY round 1 — selftest, 2026-01-02" "| Finding | Verdict | Note |" "|---|---|---|" "| 1 Info | noise | ok |"; status
+has "→  SHIP (human)" "status: a VERIFY round without real findings → SHIP"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-2 Low | noise | rationale |" "" \
+  "### VERIFY round 1 — selftest, 2026-01-02" "| Finding | Verdict | Note |" "|---|---|---|" "| 1 Info | noise | ok |" \
+  "| I-2 Info — flaky on Windows? | investigate | QA |"; status
+has "unclear: investigate open — I-2 in 'VERIFY round 1" "status: an open investigate in a VERIFY round is unclear, not SHIP"
+hasnt "SHIP (human)" "… and never reads SHIP"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| M-1 Medium | real | |" "| L-2 Low | investigate | |"; status
+has "unclear: investigate open — L-2" "status: an investigate beside an open real finding is unclear"
+# Evidence age: the last full line's @<sha> against later changes outside specs/ (rule 6).
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN"; commit "evidence"; status
+hasnt "evidence is older" "status: a specs-only commit after the evidence warns nothing"
+put app.txt changed; status
+has "evidence is older than the code: CHECK GREEN @$BASE, then changed: app.txt" "status: an uncommitted code change makes the evidence old"
+commit "code"; status
+has "then changed: app.txt — re-run ./scripts/check" "status: a code commit after the evidence makes it old"
+mkplan 0001 "selftest, 2026-01-01" "- CHECK GREEN (full, 1 steps, 1 s) @deadbee"; status
+has "evidence @deadbee is not a commit in this repository" "status: an unknown evidence sha is named"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN" "- CHECK GREEN (full, 1 steps, 1 s) @$(git -C "$W" rev-parse HEAD)"; status
+hasnt "evidence is older" "status: the last evidence line is the one that counts"
+put "çalışma.txt" new; status
+has "then changed: çalışma.txt — re-run" "status: a path with non-ASCII letters is named as it is, not octal-quoted"
+# Changed after approval: the approval commit's spec and plan against the working files.
+edit() { sed "$2" "$W/$1" > "$W/.edit" && mv "$W/.edit" "$W/$1"; }
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN"; status
+has "note  the plan approval is not committed yet" "status: an uncommitted approval is named, never clean"
+commit "approved"; status
+hasnt "changed after approval" "status: no change since the approval warns nothing"
+edit specs/active/0001-demo.md 's/^- \[ \] AC-1/- [x] AC-1/'
+printf '%s\n' "- CHECK GREEN (full, 1 steps, 1 s) @$BASE" "" "## Triage" "### Review round 1 — selftest, 2026-01-01" \
+  "| Finding | Verdict | Note |" "|---|---|---|" "| L-1 Low | noise | ok |" >> "$W/specs/plans/0001-plan.md"; status
+hasnt "changed after approval" "status: ticks, new evidence and a triage table are not changes after approval"
+edit specs/active/0001-demo.md 's/^- \[x\] AC-1 — it works$/- [ ] ~~AC-1 — it works~~ → moved to B-1 | selftest, 2026-01-02, why/'; status
+hasnt "changed after approval" "status: a criterion moved out per the template is not a change after approval"
+edit specs/plans/0001-plan.md 's/^1\. Write app\.txt\.$/1. Write app.txt twice./'; status
+has "WARN  the plan changed after approval (@" "status: a changed plan step after approval warns"
+has "Ordered steps — commit the change together with its A-<n> line" "… naming the section and what to do"
+printf '%s\n' "" "## Amendments" "A-1 — step 1 writes twice — review round 1 — selftest, 2026-01-02" >> "$W/specs/plans/0001-plan.md"; status
+has "note  amended (A-1): the plan's Ordered steps changed after approval" "status: the same change with a new A-<n> line reads amended"
+hasnt "WARN  the plan changed" "… and does not warn"
+edit specs/active/0001-demo.md 's/AC-1 — it works/AC-1 — it works fast/'; status
+has "WARN  the spec changed after approval (@" "status: a changed criterion text after approval warns"
+has "Acceptance criteria — get the plan re-approved" "… naming the section"
+rm -rf "$TMP/nogit"; cp -R "$W" "$TMP/nogit"; rm -rf "$TMP/nogit/.git"
+run sh "$TMP/nogit/scripts/status"
+has "note  no git history: changes after approval cannot be checked" "status: without git the row says the check could not run"
+has "note  no git history: evidence age" "… and a note says so for the whole run"
+rm -rf "$TMP/nogit"
+# A re-approval is the new baseline; a committed amendment moves the plan's baseline, never past it.
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN"; commit "approved"
+edit specs/active/0001-demo.md 's/^Demo intent\.$/Demo intent, widened./'; status
+has "WARN  the spec changed after approval (@" "status: a changed Intent after approval warns"
+edit specs/plans/0001-plan.md 's/selftest, 2026-01-01/selftest, 2026-01-05/'; status
+has "note  the plan approval is not committed yet" "status: a re-approval not committed yet is named"
+commit "re-approved"; status
+hasnt "changed after approval" "status: a committed re-approval is the new baseline"
+hasnt "not committed yet" "… and is read as committed"
+edit specs/plans/0001-plan.md 's/^1\. Write app\.txt\.$/1. Write app.txt twice./'
+printf '%s\n' "" "## Amendments" "A-1 — step 1 writes twice — review round 1 — selftest, 2026-01-06" >> "$W/specs/plans/0001-plan.md"
+commit "A-1"; status
+hasnt "changed after approval" "status: a change committed with its amendment warns nothing"
+edit specs/plans/0001-plan.md 's/^1\. Write app\.txt twice\.$/1. Delete everything./'; status
+has "WARN  the plan changed after approval (@$(git -C "$W" rev-parse --short HEAD)): Ordered steps" "status: a change after a committed amendment warns again"
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN"; commit "approved"; ap=$(git -C "$W" rev-parse --short HEAD)
+edit specs/plans/0001-plan.md 's/^- app\.txt$/- app.txt, lib.txt/'; commit "unrecorded change"
+printf '%s\n' "" "## Amendments" "A-1 — step wording — review round 1 — selftest, 2026-01-06" >> "$W/specs/plans/0001-plan.md"
+commit "A-1, unrelated"; status
+has "WARN  the plan changed after approval (@$ap): Files to change or add" "status: an amendment does not cover an earlier unrecorded change"
+has "(one committed after the change does not cover it), or get the plan re-approved (a new Approved by / on value)" "… and the warning names both ways out"
+printf '%s\n' "A-2 — Files gains lib.txt — review round 1 — selftest, 2026-01-07" >> "$W/specs/plans/0001-plan.md"; status
+has "WARN  the plan changed after approval (@$ap)" "status: an uncommitted amendment does not cover a committed unrecorded change"
+git -C "$W" checkout -q -- specs/plans/0001-plan.md
+rm "$W/specs/plans/0001-plan.md"; commit "plan removed"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN"; edit specs/plans/0001-plan.md 's/^- app\.txt$/- app.txt, lib.txt/'; commit "plan re-added"; status
+has "WARN  the plan changed after approval (@$ap)" "status: deleting and re-adding the plan does not reset its approval"
+# Approved content inside a fence is compared; an inline fence hides nothing.
+reset; mkspec 0001 "In progress"
+put specs/plans/0001-plan.md "# Plan 0001 — demo" "" "- Spec: \`specs/active/0001-demo.md\`" "- Status: Approved" \
+  "- Approved by / on: selftest, 2026-01-01" "" "## Files to change or add" "- app.txt" "" "## Ordered steps" \
+  "1. Clean:" '```sh' "rm -i build/" '```' '```make``` builds it' "" "## Build evidence" "$GREEN"
+commit "approved"; status
+has "→  REVIEW (fresh session" "status: a line with an inline fence does not hide the rest of the file"
+hasnt "changed after approval" "… and no change warns nothing"
+edit specs/plans/0001-plan.md 's/^rm -i build\/$/rm -rf build\//'; status
+has "WARN  the plan changed after approval (@" "status: a change inside a fenced block after approval warns"
+# Not drift: status lines, and a wrapped criterion moved out per the template.
+reset; put specs/active/0001-demo.md "# Spec 0001 — demo" "" "- Status: In progress" "" "## Intent" "Demo intent." "" \
+  "## Acceptance criteria" "- [ ] AC-1 — it works and it" "  wraps to a second line"
+mkplan 0001 "selftest, 2026-01-01" "$GREEN"; commit "approved"
+edit specs/active/0001-demo.md 's/^- Status: In progress$/- Status: Approved/'
+edit specs/plans/0001-plan.md 's/^- Status: Approved$/- Status: Superseded/'; status
+hasnt "changed after approval" "status: a spec or plan status change is not a change after approval"
+put specs/active/0001-demo.md "# Spec 0001 — demo" "" "- Status: In progress" "" "## Intent" "Demo intent." "" \
+  "## Acceptance criteria" "- [ ] ~~AC-1 — it works and it" "  wraps to a second line~~ → moved to B-1 | selftest, 2026-01-02, why"; status
+hasnt "changed after approval" "status: a wrapped criterion moved out per the template is not a change"
+edit specs/active/0001-demo.md 's/wraps to a second line~~/wraps to a third line~~/'; status
+has "WARN  the spec changed after approval (@" "status: a change on a criterion's continuation line warns"
+has "(a new Approved by / on value in the plan; same day: add re-approved)" "… and says how a same-day re-approval is written"
+put specs/active/0001-demo.md "# Spec 0001 — demo" "" "- Status: In progress" "" "## Intent" "Demo intent." "" \
+  "## Acceptance criteria" "- [ ] ~~AC-1 — it works and it" "  wraps to a second line~~"; status
+has "WARN  the spec changed after approval (@" "status: a struck criterion without a moved-to tail is a change (never waived)"
+
+reset; put specs/done/0001-demo.md "# Spec 0001 — demo" "" "- Status: Shipped"; status
+has "0001  demo  shipped" "status: a spec in specs/done/ is shipped"
+reset; mkspec 0001 "In progress"; status
+has "unclear: the spec is In progress but has no plan" "status: a state outside the rules is unclear, not a stage"
+reset; mkspec 0001 Draft; mkplan 0001 "—"; status
+has "unclear: a plan exists but the spec is Draft" "status: a plan for a Draft spec is unclear"
+# --json: the same rows for tools, in the shape docs/commands.md documents.
+reset; mkspec 0001 Draft; put specs/done/0002-demo.md "# Spec 0002 — demo" "" "- Status: Shipped"; status --json
+exits 0 "status --json: exit 0"
+has '{"anew_status":1,"rows":[{"spec":"0001","name":"demo","spec_status":"Draft","plan_status":"—","stage":"ANALYZE","who":"human","next":"approve the spec (end of /analyze)","warnings":[],"notes":[]},{"spec":"0002","name":"demo","spec_status":"Shipped","plan_status":"","stage":"shipped","who":"","next":"","warnings":[],"notes":[]}],"notes":[]}' "status --json: exact document for a two-row workspace"
+hasnt "== ANEW status ==" "status --json: no text header"
+reset; put specs/active/0001-demo.md "# Spec 0001 — demo" "" '- Status: Dr"aft\x	y'; status --json
+has '"stage":"unclear: spec status '"'"'Dr\"aft\\x\ty'"'"' is not Draft, Approved or In progress"' "status --json: quotes, backslashes and tabs are escaped"
+reset; put specs/active/0001-demo.md "# Spec 0001 — demo" "" "- Status: Dr$(printf '\001')aft$(printf '\033')[31m"; status --json
+has "Dr\\u0001aft\\u001b[31m" "status --json: other control characters are \\u00XX"
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "- CHECK GREEN (full, 1 steps, 1 s) @deadbee"; status --json
+has '"warnings":["evidence @deadbee is not a commit in this repository — re-run ./scripts/check and record it"],"notes":["the plan approval is not committed yet: changes after approval cannot be checked"]' "status --json: a row carries its warnings and notes"
+reset; status --json
+has '{"anew_status":1,"rows":[],"notes":[]}' "status --json: an empty workspace is an empty list"
+# Read-only: a run with every check active leaves the working tree as it was.
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN"; commit "approved"
+put app.txt changed; edit specs/plans/0001-plan.md 's/^1\. Write app\.txt\.$/1. Changed./'
+before=$(git -C "$W" status --porcelain); status; status --json; after=$(git -C "$W" status --porcelain)
+[ "$before" = "$after" ]; report $? "status: a run changes no file (git status --porcelain unchanged)"
+touch -t 202001010000 "$W/README.md"; before=$(cksum < "$W/.git/index"); status; after=$(cksum < "$W/.git/index")
+[ "$before" = "$after" ]; report $? "status: a run does not refresh .git/index (no optional locks)"
+status --jsno
+exits 2 "status: unknown argument";               has "usage: scripts/status [--json]" "status: unknown argument prints the usage"
+
+# --- scripts/gate: the same copy; gate commits as the fixture's git user ---
+gate() { run sh "$W/scripts/gate" "$@"; }
+TODAY=$(date +%Y-%m-%d)
+git -C "$W" config user.name selftest; git -C "$W" config user.email selftest@example.invalid
+plan_file() { cat "$W/specs/plans/0001-plan.md"; }
+commits() { git -C "$W" rev-list --count HEAD; }
+echo "== scripts/gate =="
+reset; mkspec 0001 Draft; commit "draft"; c0=$(commits); gate approve-spec 0001
+exits 0 "gate approve-spec: a Draft spec is approved"
+has "approve-spec 0001: spec approved — specs/active/0001-demo.md @" "gate approve-spec: names what, where and the commit"
+grep -q '^- Status: Approved$' "$W/specs/active/0001-demo.md"; report $? "gate approve-spec: the spec reads Status: Approved"
+[ "$(commits)" -eq $((c0 + 1)) ] && [ -z "$(git -C "$W" status --porcelain)" ]; report $? "gate approve-spec: one commit, nothing left uncommitted"
+status; has "→  PLAN (Developer)" "gate approve-spec: status moves on to PLAN"
+gate approve-spec 0001
+exits 1 "gate approve-spec: refused on an approved spec";   has "0001 is at PLAN (Developer); approve-spec decides ANALYZE" "… naming the stage it found"
+gate approve-plan 0001
+exits 1 "gate approve-plan: refused without a plan";        has "no plan specs/plans/0001-plan.md" "… and says so"
+# approve-plan on the template's own approval line (a comment spanning two lines)
+put specs/plans/0001-plan.md "# Plan 0001 — demo" "" "- Spec: \`specs/active/0001-demo.md\`" "- Status: Awaiting approval" \
+  "- Approved by / on: — <!-- This line IS the plan gate record: \"<name>, <YYYY-MM-DD>\", written" \
+  "  at the end of /plan on human approval. While it is empty (\"—\"), /build refuses to start. -->" "" \
+  "## Files to change or add" "- app.txt" "" "## Ordered steps" "1. Write app.txt." "" "## Build evidence"
+c0=$(commits); gate approve-plan 0001
+exits 0 "gate approve-plan: the template's approval line is filled"
+grep -q "^- Approved by / on: selftest, $TODAY\$" "$W/specs/plans/0001-plan.md" && grep -q '^- Status: Approved$' "$W/specs/plans/0001-plan.md" \
+  && ! grep -q 'refuses to start' "$W/specs/plans/0001-plan.md"; report $? "gate approve-plan: Status and Approved by / on written, the spanning comment dropped"
+has "committed with your uncommitted edits to specs/plans/0001-plan.md" "gate approve-plan: an uncommitted plan is committed as it is, and named"
+[ "$(commits)" -eq $((c0 + 1)) ] && [ -z "$(git -C "$W" status --porcelain)" ]; report $? "gate approve-plan: one commit"
+status; has "→  BUILD (Developer)" "gate approve-plan: status reads BUILD"
+hasnt "not committed yet" "gate approve-plan: status reads the approval as committed"
+# re-approval clears a spec drift warning
+mkspec 0001 "In progress"; edit specs/active/0001-demo.md 's/^1\. It works\.$/1. It works well./'; commit "spec change"; status
+has "the spec changed after approval" "gate approve-plan: (a spec change after approval warns)"
+gate approve-plan 0001
+exits 0 "gate approve-plan: a re-approval is written"
+grep -q "^- Approved by / on: selftest, $TODAY (re-approved)\$" "$W/specs/plans/0001-plan.md"; report $? "gate approve-plan: the same day adds (re-approved)"
+status; hasnt "changed after approval" "gate approve-plan: the re-approval clears the drift warning"
+gate approve-plan 0001
+exits 1 "gate approve-plan: a second re-approval the same day is refused"
+reset; mkspec 0001 Draft; mkplan 0001 "—"; commit "x"; gate approve-plan 0001
+exits 1 "gate approve-plan: refused while the spec is Draft"; has "the spec is Draft" "… naming the spec status"
+# triage
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "" "## Amendments"; commit "evidence"
+gate triage 0001 --verify
+exits 1 "gate triage: a VERIFY round is refused at REVIEW"
+gate triage 0001 --review --finding "M-1 Medium — wrong total" real "" --finding "L-2 Low — naming" noise "matches the domain word"
+exits 0 "gate triage: a review round is written"
+plan_file | grep -q "^### Review round 1 — selftest, $TODAY\$"; report $? "gate triage: the heading follows the template, round 1"
+plan_file | awk '/^## Triage/{t=1} /^## Amendments/{if (t && seen) ok=1; t=0} t && /^\| L-2 Low/{seen=1} END{exit !ok}'; report $? "gate triage: the table sits inside ## Triage, before the next section"
+status; has "→  FIX ROUND (Developer)" "gate triage: status reads the written round (FIX ROUND for an open real finding)"
+put app.txt fixed; commit "fix: m-1 [plan 0001/fix-1]"
+sed "s/^| M-1 Medium — wrong total | real |  |\$/| M-1 Medium — wrong total | real | fix-1 |/" "$W/specs/plans/0001-plan.md" > "$TMP/p" && cat "$TMP/p" > "$W/specs/plans/0001-plan.md"; commit "note"
+gate triage 0001 --review
+exits 0 "gate triage: a clean re-review is written"
+plan_file | grep -q "^### Review round 2 — selftest, $TODAY\$"; report $? "gate triage: the next round number"
+status; has "→  VERIFY (QA)" "gate triage: a clean review round → status reads VERIFY"
+c0=$(commits); before=$(cksum < "$W/specs/plans/0001-plan.md"); ib=$(git -C "$W" diff --cached --stat)
+gate triage 0001 --verify --finding "F-1 Low" maybe "x"
+exits 2 "gate triage: an unknown verdict";                 has "verdict 'maybe'" "… is named"
+gate triage 0001 --verify --finding "F-1 Low" noise "  "
+exits 2 "gate triage: a noise verdict without a rationale"
+gate triage 0001 --verify --finding "F-1 Low" defer "later"
+exits 2 "gate triage: a defer without a B-<n>"
+gate triage 0001 --verify --finding "F-1 Low" defer "B-7"
+exits 2 "gate triage: a defer whose B-<n> the backlog does not hold"; has "B-7 is not in specs/backlog.md" "… is named"
+gate triage 0001 --verify --finding "F-1 | Low" real "x"
+exits 2 "gate triage: a '|' in a finding"
+gate triage 0001 --verify --finding "" real "x"
+exits 2 "gate triage: an empty finding";                   has "usage: scripts/gate" "… prints the usage"
+gate triage 0001 --verify --finding "F-1 Low" real
+exits 2 "gate triage: a --finding with two values"
+gate triage 0001 --verify --finding "F-1 Low
+second line" real "x"
+exits 2 "gate triage: a line break in a finding";          has "a tab or a line break" "… is named"
+gate triage 0001 --verify --finding "F-1 Low" noise "a	tab"
+exits 2 "gate triage: a tab in a note"
+[ "$(commits)" -eq "$c0" ] && [ "$(cksum < "$W/specs/plans/0001-plan.md")" = "$before" ] && [ "$(git -C "$W" diff --cached --stat)" = "$ib" ]
+report $? "gate triage: bad input leaves the plan, the index and the history unchanged"
+put specs/backlog.md "# Backlog" "" "- **B-7** — later"; commit "backlog"
+gate triage 0001 --verify --finding "F-1 Low — slow" defer "B-7" --finding "I-2 Info — flaky?" investigate "QA"
+exits 0 "gate triage: a defer naming a backlog entry is written"
+status; has "unclear: investigate open — I-2" "gate triage: status reads the investigate"
+gate triage 0001 --verify --finding "I-2 Info — flaky?" noise "QA: one-off runner timeout"
+exits 0 "gate triage: an investigate is answered by a new round"
+plan_file | grep -q "^### VERIFY round 2 — selftest, $TODAY\$"; report $? "gate triage: VERIFY rounds are numbered apart from review rounds"
+status; has "→  SHIP (human)" "gate triage: a VERIFY round with no real finding → SHIP"
+# ship
+put specs/active/0001-demo.md "# Spec 0001 — demo" "" "- Status: In progress" "- Mode: lite" "- Plan: \`specs/plans/0001-plan.md\`" \
+  "- Self-critique: done" "" "## Intent" "Demo intent." "" "## Requirements" "1. It works well." "" "## Acceptance criteria" \
+  "- [ ] AC-1 — it works" "- [ ] ~~AC-2 — it flies~~ → moved to B-7 — selftest, 2026-01-01, later" "" "## Definition of Done" "- [ ] Docs updated"
+sed "s/@$BASE\$/@$(git -C "$W" rev-parse HEAD)/" "$W/specs/plans/0001-plan.md" > "$TMP/p" && cat "$TMP/p" > "$W/specs/plans/0001-plan.md"
+commit "spec ready, evidence after the fix"; gate approve-plan 0001 >/dev/null 2>&1
+put specs/notes.md staged; git -C "$W" add specs/notes.md; c0=$(commits); gate ship 0001
+exits 0 "gate ship: a spec at SHIP is shipped"
+[ -f "$W/specs/done/0001-demo.md" ] && [ ! -e "$W/specs/active/0001-demo.md" ]; report $? "gate ship: the spec moved to specs/done/"
+d="$W/specs/done/0001-demo.md"
+grep -q '^- Status: Shipped$' "$d" && grep -q '^- \[x\] AC-1 — it works$' "$d" && grep -q '^- \[ \] ~~AC-2' "$d" && grep -q '^- \[x\] Docs updated$' "$d"
+report $? "gate ship: Shipped, the criterion ticked, the struck one left, the DoD ticked"
+plan_file | grep -q '^- Spec: `specs/done/0001-demo.md`$'; report $? "gate ship: the plan's Spec line points at the new path"
+[ "$(commits)" -eq $((c0 + 1)) ] && git -C "$W" show --stat --format= HEAD | grep -q 'specs/{active => done}/0001-demo.md'
+report $? "gate ship: one commit that records the move"
+[ "$(git -C "$W" status --porcelain)" = "A  specs/notes.md" ]; report $? "gate ship: an unrelated staged file stays staged and out of the commit"
+git -C "$W" reset -q specs/notes.md; rm -f "$W/specs/notes.md"
+ship_doctor() { run sh -c 'unset GITHUB_BASE_REF GITHUB_EVENT_PATH; ANEW_BASE_REF=HEAD~1; export ANEW_BASE_REF; exec sh "$0" --strict' "$W/scripts/doctor"; }
+ship_doctor; exits 0 "gate ship: doctor --strict is green on the result (base: before the ship)"; hasnt "new ship" "… no new-ship finding"
+hasnt "moved criterion" "… the moved-out criterion included";  hasnt "is not marked 'Status: Shipped'" "… and the status check"
+sed 's/^- \[x\] AC-1/- [ ] AC-1/' "$d" > "$TMP/p" && cat "$TMP/p" > "$d"; ship_doctor
+has "unchecked criterion in a new ship: specs/done/0001-demo.md AC-1" "… (doctor does judge this ship: an unticked criterion fails it)"
+git -C "$W" checkout -q -- specs/done/0001-demo.md
+status; has "0001  demo  shipped" "gate ship: status reads shipped"
+gate ship 0001
+exits 1 "gate ship: a shipped spec is refused";            has "0001 is shipped" "… and says so"
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN"; commit "evidence"; gate ship 0001
+exits 1 "gate ship: refused at REVIEW";                    has "ship decides SHIP" "… naming the stage it decides"
+reset; mkspec 0001 "In progress"; mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### VERIFY round 1 — selftest, 2026-01-02"
+commit "verify"; put app.txt changed; commit "code after the evidence"; gate ship 0001
+exits 1 "gate ship: refused with a status warning";        has "has a status warning" "… and says so"
+# a spec at SHIP: <spec lines…>; the plan's evidence @BASE, a clean VERIFY round, B-7 in the backlog
+shipfx() { reset; put specs/active/0001-demo.md "$@"; put specs/backlog.md "# Backlog" "" "- **B-7** — later"
+  mkplan 0001 "selftest, 2026-01-01" "$GREEN" "" "## Triage" "### VERIFY round 1 — selftest, 2026-01-02"; commit "at ship"; }
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "- Mode: lite" "- Plan: \`specs/plans/0001-plan.md\`" "- Source: T-1" "" \
+  "## Intent" "Demo." "" "## Changed behavior" "- [ ] CB-1 — a" "- [ ] CB-2 — b" "" "## Preserved behavior" "- [ ] PB-1 — c" "" \
+  "## Definition of Done" "- [ ] Spec moved to \`specs/done/\`"
+gate ship 0001
+exits 0 "gate ship: a mini spec is shipped"
+d="$W/specs/done/0001-demo.md"
+grep -q '^- \[x\] CB-1' "$d" && grep -q '^- \[x\] CB-2' "$d" && grep -q '^- \[x\] PB-1' "$d"; report $? "gate ship: a mini spec's CB-/PB- criteria are ticked"
+ship_doctor; exits 0 "gate ship: doctor --strict is green on a shipped mini spec"; hasnt "unchecked criterion" "… no unchecked criterion"
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — the ~~old~~ new total" \
+  "* [ ] AC-2 — a star bullet" "- [ ] ~~AC-3 — gone~~ -> moved to B-7 — selftest, 2026-01-01, later" \
+  "- [ ] AC-4 — the quoted \`→ moved to B-7\` marker" "" "## Definition of Done" "- [ ] Docs"
+gate ship 0001
+exits 0 "gate ship: criterion forms doctor reads are shipped"
+grep -q '^- \[x\] AC-1 — the ~~old~~ new total$' "$d" && grep -q '^\* \[x\] AC-2' "$d" && grep -q '^- \[ \] ~~AC-3' "$d"
+report $? "gate ship: a strike in the prose and a star bullet are ticked; an ASCII -> move is left"
+grep -q '^- \[x\] AC-4 — the quoted' "$d"; report $? "gate ship: a marker inside backticks is quoted text, so the criterion is ticked"
+ship_doctor; exits 0 "gate ship: doctor --strict is green on those forms"
+# a moved-out criterion doctor would fail is refused before anything is written
+for mv in "→ moved to nowhere|is neither B-<n> nor spec <NNNN>" "→ moved to B-99 — later|B-99: no such entry" \
+  "→ moved to spec 0001 — itself|cannot move to its own spec" "→ moved to spec 0042 — later|spec 0042: no such spec"; do
+  shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — ok" "- [ ] ~~AC-2 — gone~~ ${mv%%|*}" \
+    "" "## Definition of Done" "- [ ] Docs"
+  c0=$(commits); gate ship 0001
+  exits 1 "gate ship: refused for '${mv%%|*}'";           has "${mv#*|}" "… naming why"
+  [ "$(commits)" -eq "$c0" ] && [ -z "$(git -C "$W" status --porcelain)" ]; report $? "… and nothing is written"
+done
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "- Sensitive area: payments" "" "## Acceptance criteria" "- [ ] AC-1 — ok" \
+  "- [ ] ~~AC-2 — gone~~ → moved to B-7 — later" "" "## Definition of Done" "- [ ] Docs"
+c0=$(commits); gate ship 0001
+exits 1 "gate ship: a move in a sensitive-area spec is refused"; has "is in a sensitive area: AC-2" "… naming it"
+[ "$(commits)" -eq "$c0" ] && [ -z "$(git -C "$W" status --porcelain)" ]; report $? "… and nothing is written"
+sed 's/^- Sensitive area: payments$/- Sensitive area: none/' "$W/specs/active/0001-demo.md" > "$TMP/p" && cat "$TMP/p" > "$W/specs/active/0001-demo.md"
+commit "not sensitive"; gate ship 0001
+exits 0 "gate ship: 'Sensitive area: none' allows the move, as doctor reads it"
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — ok" "- [ ] ~~AC-2 — gone~~" \
+  "" "## Definition of Done" "- [ ] Docs"
+c0=$(commits); before=$(cksum < "$W/specs/active/0001-demo.md"); gate ship 0001
+exits 1 "gate ship: a struck criterion without a target is refused"; has "AC-2 is struck without a '→ moved to' target" "… naming it"
+[ "$(commits)" -eq "$c0" ] && [ "$(cksum < "$W/specs/active/0001-demo.md")" = "$before" ] && [ -z "$(git -C "$W" status --porcelain)" ]
+report $? "gate ship: … and nothing is written"
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — ok" "" "## Definition of Done" "- [ ] Docs"
+sed 's|^- Spec: .*|- Spec: elsewhere|' "$W/specs/plans/0001-plan.md" > "$TMP/p" && cat "$TMP/p" > "$W/specs/plans/0001-plan.md"; commit "spec line"
+gate ship 0001
+exits 1 "gate ship: a plan whose Spec line does not name the spec is refused"; has "no '- Spec:' line names specs/active/0001-demo.md" "… and says so"
+[ -f "$W/specs/active/0001-demo.md" ] && [ -z "$(git -C "$W" status --porcelain)" ]; report $? "gate ship: … and nothing is written"
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — ok" "" "## Definition of Done" "- [ ] Docs"
+sed 's|^- Approved by / on: .*|- Approved by / on: someone, 2026-01-03|' "$W/specs/plans/0001-plan.md" > "$TMP/p" && cat "$TMP/p" > "$W/specs/plans/0001-plan.md"
+gate ship 0001
+exits 1 "gate ship: refused while the approval is not committed"; has "approval is not committed yet" "… and says so"
+git -C "$W" checkout -q -- specs/plans/0001-plan.md
+printf '%s\n' "- [ ] Scorecard filled" >> "$W/specs/active/0001-demo.md"; gate ship 0001
+exits 0 "gate ship: uncommitted spec edits are shipped with it"
+has "committed with your uncommitted edits to specs/active/0001-demo.md" "gate ship: … and named"
+grep -q '^- \[x\] Scorecard filled$' "$d"; report $? "gate ship: … ticked as part of the DoD"
+# a failed commit (a hook) puts every file and the index back
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — ok" "" "## Definition of Done" "- [ ] Docs"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$W/.git/hooks/pre-commit"; chmod +x "$W/.git/hooks/pre-commit"
+# a staged and an unstaged edit in both targets: the rollback must keep each where it was
+printf '%s\n' "- [ ] Staged item" >> "$W/specs/active/0001-demo.md"; printf '%s\n' "- staged note" >> "$W/specs/plans/0001-plan.md"
+git -C "$W" add specs/active/0001-demo.md specs/plans/0001-plan.md
+printf '%s\n' "- [ ] Unstaged item" >> "$W/specs/active/0001-demo.md"; printf '%s\n' "- unstaged note" >> "$W/specs/plans/0001-plan.md"
+st0=$(git -C "$W" status --porcelain); dc0=$(git -C "$W" diff --cached); dw0=$(git -C "$W" diff)
+c0=$(commits); before=$(cksum < "$W/specs/active/0001-demo.md"); pb=$(cksum < "$W/specs/plans/0001-plan.md"); gate ship 0001
+exits 1 "gate ship: a failed commit is refused";           has "git commit failed — nothing was written" "… and says nothing was written"
+[ "$(commits)" -eq "$c0" ] && [ "$(git -C "$W" status --porcelain)" = "$st0" ] && [ ! -e "$W/specs/done/0001-demo.md" ] \
+  && [ "$(cksum < "$W/specs/active/0001-demo.md")" = "$before" ] && [ "$(cksum < "$W/specs/plans/0001-plan.md")" = "$pb" ]
+report $? "gate ship: … the move, the spec, the plan and the index are as before"
+[ "$(git -C "$W" diff --cached)" = "$dc0" ] && [ "$(git -C "$W" diff)" = "$dw0" ]
+report $? "gate ship: … staged edits stay staged and unstaged ones unstaged"
+git -C "$W" reset -q --hard HEAD
+mkspec 0002 Draft; git -C "$W" add specs/active/0002-demo.md; git -C "$W" commit -qn -m draft2
+put specs/notes.md staged; git -C "$W" add specs/notes.md; gate approve-spec 0002
+exits 1 "gate approve-spec: a failed commit is refused"
+grep -q '^- Status: Draft$' "$W/specs/active/0002-demo.md" && [ "$(git -C "$W" status --porcelain)" = "A  specs/notes.md" ]
+report $? "gate approve-spec: … the spec is Draft again and an unrelated staged file stays staged"
+rm -f "$W/.git/hooks/pre-commit"; git -C "$W" reset -q specs/notes.md; rm -f "$W/specs/notes.md"; gate ship 0001
+exits 0 "gate ship: after the hook is fixed the same ship goes through"
+# an interrupt: before the commit it restores and says so; after the commit landed it undoes nothing
+interrupt_hook() {  # interrupt_hook <hook> <exit>: the hook sends TERM to gate, then exits
+  printf '%s\n' '#!/bin/sh' "kill -TERM \"\$(cat '$TMP/gate.pid')\"" "sleep 1" "exit $2" > "$W/.git/hooks/$1"
+  chmod +x "$W/.git/hooks/$1"; }
+gate_bg() { sh "$W/scripts/gate" "$@" > "$TMP/gate.out" 2>&1 & echo $! > "$TMP/gate.pid"; wait $!; rc=$?; out=$(cat "$TMP/gate.out"); }
+shipfx "# Spec 0001 — demo" "" "- Status: In progress" "" "## Acceptance criteria" "- [ ] AC-1 — ok" "" "## Definition of Done" "- [ ] Docs"
+interrupt_hook pre-commit 1; c0=$(commits); gate_bg ship 0001
+exits 130 "gate ship: an interrupt before the commit"; has "gate: interrupted — nothing was written" "… says it restored"
+[ "$(commits)" -eq "$c0" ] && [ -z "$(git -C "$W" status --porcelain)" ] && [ -f "$W/specs/active/0001-demo.md" ]
+report $? "… and the files, the move and the index are as before"
+rm -f "$W/.git/hooks/pre-commit"; interrupt_hook post-commit 0; gate_bg ship 0001
+exits 130 "gate ship: an interrupt after the commit landed"; has "interrupted after the commit landed" "… says the commit holds the decision"
+[ "$(commits)" -eq $((c0 + 1)) ] && [ -z "$(git -C "$W" status --porcelain)" ] && [ -f "$W/specs/done/0001-demo.md" ]
+report $? "… and undoes nothing: the tree matches the new commit"
+rm -f "$W/.git/hooks/post-commit"
+# approve-plan writes both lines or neither
+reset; mkspec 0001 Approved; put specs/plans/0001-plan.md "# Plan 0001 — demo" "" "- Spec: \`specs/active/0001-demo.md\`" \
+  "- Status: Awaiting approval" "" "## Ordered steps" "1. x"; commit "plan without approval line"
+before=$(cksum < "$W/specs/plans/0001-plan.md"); gate approve-plan 0001
+exits 1 "gate approve-plan: a plan without an Approved by / on line is refused"
+[ "$(cksum < "$W/specs/plans/0001-plan.md")" = "$before" ] && [ -z "$(git -C "$W" status --porcelain)" ]; report $? "gate approve-plan: … and nothing is written"
+# state and arguments
+reset; mkspec 0001 Draft; commit "draft"; git -C "$W" config user.name ""; gate approve-spec 0001
+exits 1 "gate: refused without a git user name";           has "user.name is empty" "… and says so"
+git -C "$W" config user.name selftest
+gate approve-spec 0002
+exits 1 "gate: refused for an unknown spec";               has "no spec 0002 in specs/active/" "… and says so"
+gate approve-spec 1
+exits 2 "gate: a spec number that is not four digits"
+gate approve 0001
+exits 2 "gate: an unknown gate";                           has "usage: scripts/gate" "… prints the usage"
+gate approve-spec 0001 --now
+exits 2 "gate: an unknown argument"
+rm -rf "$TMP/ng"; mkdir -p "$TMP/ng"; cp -R "$W/scripts" "$W/specs" "$TMP/ng/"
+run sh "$TMP/ng/scripts/gate" approve-spec 0001
+exits 1 "gate: refused without git";                       has "no git history" "… and says so"
+grep -q '^- Status: Draft$' "$TMP/ng/specs/active/0001-demo.md"; report $? "gate: without git nothing is written"
+
+# --- scripts/adopt: from a copy of the core, marked as an unconfigured template (so it runs the
+# same in the template and in a bootstrapped project), with the template's own files beside it ---
+echo "== scripts/adopt =="
+A="$TMP/adopt-src"
+mkdir -p "$A"
+( cd "$ROOT" && git ls-files --cached --others --exclude-standard ) \
+  | grep -E '^(AGENTS\.md|\.anew-version|\.gitattributes|\.gitignore|\.github/workflows/check\.yml|\.github/pull_request_template\.md|docs/|workflows/|prompts/|scripts/|adapters/|specs/(TEMPLATE[^/]*\.md|backlog\.md|(active|done|plans)/README\.md|plans/TEMPLATE\.md)$)' \
+  | ( cd "$ROOT" && tar -cf - -T - ) | ( cd "$A" && tar -xf - )
+grep -q 'STATUS: NOT CONFIGURED' "$A/AGENTS.md" || printf '\n> **STATUS: NOT CONFIGURED.**\n' >> "$A/AGENTS.md"
+for f in .github/workflows/check.yml .github/pull_request_template.md specs/backlog.md; do
+  [ -f "$A/$f" ] || { mkdir -p "$(dirname "$A/$f")"; printf 'x\n' > "$A/$f"; }   # a project may have dropped one
+done
+listed() { ( cd "$1" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort ); }
+expected=$( { listed "$A"; echo README.md; } | LC_ALL=C sort)
+# the template's own files: never copied
+for f in .anew-dev/plans/0001-plan.md extensions/vscode/package.json CHANGELOG.md LICENSE .claude/settings.local.json README.md; do
+  mkdir -p "$(dirname "$A/$f")"; printf 'own:%s\n' "$f" > "$A/$f"
+done
+E="$TMP/adopt-empty"; mkdir -p "$E"
+run sh "$A/scripts/adopt" "$E"
+exits 0 "adopt: into an empty folder"
+[ "$(listed "$E")" = "$expected" ]; report $? "adopt: exactly the core list, and a README.md"
+grep -q '^Built with ANEW ' "$E/README.md"; report $? "adopt: the README is the project's three lines, not the template's"
+! grep -rqE '^own:' "$E"; report $? "adopt: the template's own files (.anew-dev, extensions, CHANGELOG, LICENSE, .claude, README) are never written"
+[ ! -e "$E/.git" ]; report $? "adopt: no git state is written"
+chmodline=$(printf '%s\n' "$out" | grep '^  git add --chmod=+x ')
+for s in adopt check doctor gate status; do case " $chmodline " in *" scripts/$s "*) ;; *) chmodline="" ;; esac; done
+[ -n "$chmodline" ]; report $? "adopt: names the line that keeps the scripts executable in a commit"
+[ -x "$E/scripts/doctor" ] && [ -x "$E/scripts/gate" ]; report $? "adopt: the scripts stay executable"
+git -C "$E" init -q
+run sh -c 'unset ANEW_BASE_REF GITHUB_BASE_REF GITHUB_EVENT_PATH; exec sh "$0"' "$E/scripts/doctor"
+has "ok    core structure complete" "adopt: doctor in the adopted folder has no structure failure"
+hasnt "FAIL" "adopt: … and no failure at all"
+P="$TMP/adopt-project"; mkdir -p "$P/docs"
+printf 'our readme\n' > "$P/README.md"; printf 'our domain\n' > "$P/docs/domain.md"; printf 'node_modules/\n' > "$P/.gitignore"
+printf '# our agents\n' > "$P/AGENTS.md"; mkdir -p "$P/scripts/lib"; printf 'x\n' > "$P/scripts/lib/util.sh"
+git -C "$P" init -q; git -C "$P" config core.autocrlf false; git -C "$P" add -A; git -C "$P" -c user.name=selftest -c user.email=selftest@example.invalid commit -qm own
+head0=$(git -C "$P" rev-parse HEAD); index0=$(cksum < "$P/.git/index")
+run sh "$A/scripts/adopt" "$P"
+exits 0 "adopt: into a project with files"
+has "kept   README.md (exists)" "adopt: an existing README is kept and named"
+has "kept   docs/domain.md (exists)" "adopt: an existing doc is kept and named"
+has "kept   .gitignore (exists)" "adopt: an existing .gitignore is kept, never overwritten"
+[ "$(cat "$P/README.md")" = "our readme" ] && [ "$(cat "$P/docs/domain.md")" = "our domain" ] && [ "$(cat "$P/.gitignore")" = "node_modules/" ]
+report $? "adopt: … each byte for byte"
+has "merge  AGENTS.md.anew into AGENTS.md" "adopt: a kept AGENTS.md gets ANEW's beside it, to merge"
+[ "$(cat "$P/AGENTS.md")" = "# our agents" ] && cmp -s "$P/AGENTS.md.anew" "$A/AGENTS.md" && cmp -s "$P/.gitignore.anew" "$A/.gitignore"
+report $? "adopt: … the project's own unchanged, the .anew files the template's"
+has "merge  .gitignore.anew into .gitignore" "adopt: a kept .gitignore is named to merge"
+hasnt "merge  docs/domain.md" "adopt: other kept files are not merge files"
+case "$(printf '%s\n' "$out" | grep '^  git add --chmod=+x ')" in *" scripts/lib"*) report 1 "adopt: the chmod line names files, not the folders under scripts/" ;; *) report 0 "adopt: the chmod line names files, not the folders under scripts/" ;; esac
+# a rerun: the files adopt wrote itself are the template's — nothing to merge; an .anew there is not replaced
+printf 'stale\n' > "$P/AGENTS.md.anew"
+run sh "$A/scripts/adopt" "$E"
+exits 0 "adopt: a rerun over its own files"
+hasnt "merge  " "adopt: a rerun over its own files asks for no merge"
+[ ! -e "$E/AGENTS.md.anew" ] && [ ! -e "$E/.gitignore.anew" ]; report $? "adopt: … and writes no .anew"
+run sh "$A/scripts/adopt" "$P"
+has "merge  AGENTS.md.anew into AGENTS.md (AGENTS.md.anew exists, not replaced" "adopt: an .anew that exists is named as not replaced"
+[ "$(cat "$P/AGENTS.md.anew")" = "stale" ]; report $? "adopt: … and left as it is"
+[ "$(git -C "$P" rev-parse HEAD)" = "$head0" ] && [ "$(cksum < "$P/.git/index")" = "$index0" ]; report $? "adopt: no commit, nothing staged"
+run sh "$A/scripts/adopt"
+exits 1 "adopt: no target"
+run sh "$A/scripts/adopt" "$TMP/adopt-none"
+exits 1 "adopt: a target that is not a folder";      has "is not a folder" "… says so"
+run sh "$A/scripts/adopt" "$A"
+exits 1 "adopt: the template itself";                has "the target is this template itself" "… says so"
+sed 's/STATUS: NOT CONFIGURED/STATUS: configured/' "$A/AGENTS.md" > "$TMP/agents" && cp "$TMP/agents" "$A/AGENTS.md"
+mkdir -p "$TMP/adopt-other"; run sh "$A/scripts/adopt" "$TMP/adopt-other"
+exits 1 "adopt: refused from a configured project";  has "is not an unconfigured ANEW template" "… says so"
+[ -z "$(ls -A "$TMP/adopt-other")" ]; report $? "adopt: … and writes nothing"
+# CI in an adopted project: every step of the extension's job after the checkout runs only where
+# the extension is (hashFiles is not available in a job-level if)
+if grep -q '^  extension:' "$ROOT/.github/workflows/check.yml" 2>/dev/null; then
+  out=$(awk '/^  [a-z]+:$/ { job = $1 } job == "extension:" && /^      - / && !/actions\/checkout/ { steps++ } job == "extension:" && /^        if: hashFiles\('"'"'extensions\/vscode\/package\.json'"'"'\) != '"''"'$/ { guards++ } END { print steps + 0, guards + 0 }' "$ROOT/.github/workflows/check.yml")
+  [ "${out% *}" -gt 0 ] && [ "${out% *}" = "${out#* }" ]; report $? "check.yml: each step of the extension job after the checkout is guarded by extensions/vscode/"
+fi
+
+# --- scripts/upgrade: a base and a new release built from the core (spec 0015), a project adopted
+# from the base with every adapter installed, bootstrapped, its own changes committed ---
+echo "== scripts/upgrade =="
+UB="$TMP/up-base"; UN="$TMP/up-new"; UP="$TMP/up-project"
+mkdir -p "$UB" "$UP"
+( cd "$ROOT" && git ls-files --cached --others --exclude-standard ) \
+  | grep -E '^(AGENTS\.md|\.anew-version|\.gitattributes|\.gitignore|\.github/workflows/check\.yml|\.github/pull_request_template\.md|docs/|workflows/|prompts/|scripts/|adapters/|specs/(TEMPLATE[^/]*\.md|backlog\.md|(active|done|plans)/README\.md|plans/TEMPLATE\.md)$)' \
+  | ( cd "$ROOT" && tar -cf - -T - ) | ( cd "$UB" && tar -xf - )
+grep -q 'STATUS: NOT CONFIGURED' "$UB/AGENTS.md" || printf '\n> **STATUS: NOT CONFIGURED.**\n' >> "$UB/AGENTS.md"
+for f in .github/workflows/check.yml .github/pull_request_template.md specs/backlog.md; do
+  [ -f "$UB/$f" ] || { mkdir -p "$(dirname "$UB/$f")"; printf 'x\n' > "$UB/$f"; }
+done
+printf 'v9.0\n' > "$UB/.anew-version"; printf 'gone\n' > "$UB/prompts/gone.md"
+cp -R "$UB" "$UN"
+printf 'v9.1\n' > "$UN/.anew-version"; rm "$UN/prompts/gone.md"
+printf '\n# v9.1\n' >> "$UN/scripts/doctor"
+for f in docs/domain.md docs/testing.md; do printf '\nv9.1 text\n' >> "$UN/$f"; done
+printf 'new\n' > "$UN/workflows/new-thing.md"
+find "$UN/adapters" -type f ! -name README.md | while IFS= read -r f; do printf '\n# v9.1\n' >> "$f"; done
+printf '# v9.1\n' > "$UN/adapters/cursor/commands/new-cmd.md"; rm "$UN/adapters/cursor/commands/adr.md"
+printf '#!/bin/sh\n# v9.1\n' > "$UN/adapters/claude-code/.claude/hooks/new-hook.sh"
+printf 'upstream\n' > "$UN/docs/new-doc.md"
+sh "$UB/scripts/adopt" "$UP" >/dev/null
+for a in claude-code github-copilot cursor codex; do sh "$UP/scripts/init" "$a" >/dev/null; done
+grep -v 'STATUS: NOT CONFIGURED' "$UP/AGENTS.md" > "$TMP/agents" && cp "$TMP/agents" "$UP/AGENTS.md"
+printf '\nour domain\n' >> "$UP/docs/domain.md"; printf '\nour architecture\n' >> "$UP/docs/architecture.md"
+printf 'ours\n' > "$UP/docs/new-doc.md"; rm "$UP/docs/security.md"; rm -rf "$UP/adapters/cursor"
+printf '\nour step\n' >> "$UP/.claude/commands/new-feature.md"   # a customized adapter file (N-1)
+ug() { git -C "$UP" -c core.safecrlf=false -c user.name=selftest -c user.email=selftest@example.invalid "$@"; }
+ug init -q; ug config core.autocrlf false; ug add -A; ug commit -qm bootstrapped
+head0=$(ug rev-parse HEAD)
+run sh "$UN/scripts/upgrade" "$UB" "$UP"
+exits 0 "upgrade: a bootstrapped project from v9.0 to v9.1"
+has "replaced scripts/doctor" "upgrade: an unchanged script is replaced"
+has "replaced docs/testing.md" "upgrade: an unchanged document is replaced"
+has "added    workflows/new-thing.md" "upgrade: a new file is added"
+has "removed  prompts/gone.md" "upgrade: a file the new release removed is removed"
+has "merge    docs/domain.md" "upgrade: a file both changed is listed to merge"
+has "kept     docs/architecture.md" "upgrade: the project's own change, nothing new upstream, is kept"
+has "kept     AGENTS.md" "upgrade: the bootstrapped AGENTS.md is kept when the release left it"
+cmp -s "$UP/scripts/doctor" "$UN/scripts/doctor" && cmp -s "$UP/docs/testing.md" "$UN/docs/testing.md" && [ ! -e "$UP/prompts/gone.md" ] && [ -f "$UP/workflows/new-thing.md" ]
+report $? "upgrade: … each written as the new release has it"
+grep -q '^our domain$' "$UP/docs/domain.md" && ! grep -q 'v9.1 text' "$UP/docs/domain.md" && grep -q '^our architecture$' "$UP/docs/architecture.md"
+report $? "upgrade: a file the project changed is never touched"
+missed=$(for d in CLAUDE.md .claude .github/copilot-instructions.md .github/prompts .github/agents .github/instructions .cursor .agents; do
+  [ -e "$UP/$d" ] && find "$UP/$d" -type f ! -name settings.local.json ! -path '*/.claude/commands/new-feature.md'; done | while IFS= read -r f; do grep -q '^# v9.1$' "$f" || echo "$f"; done)
+[ -z "$missed" ] && [ -f "$UP/.cursor/commands/review.md" ] && [ -f "$UP/.agents/skills/review/SKILL.md" ]
+report $? "upgrade: every file scripts/init installed, for each adapter, is upgraded${missed:+ — missed: $missed}"
+[ "$(head -n 1 "$UP/.anew-version")" = "v9.0" ]; report $? "upgrade: .anew-version is not written"
+[ "$(ug rev-parse HEAD)" = "$head0" ]; report $? "upgrade: nothing is committed"
+has "git add --chmod=+x" "upgrade: names the chmod line when it wrote a script"
+has " .claude/hooks/new-hook.sh" "upgrade: … and the hooks, run directly too (review round 1, L-4)"
+has "merge    .claude/commands/new-feature.md" "upgrade: a customized adapter file is listed to merge, the adapter still upgraded (N-1)"
+grep -q '^our step$' "$UP/.claude/commands/new-feature.md"; report $? "upgrade: … and left as the project wrote it"
+has "to merge." "upgrade: a summary line"
+has "added    .cursor/commands/new-cmd.md" "upgrade: an installed adapter gets a file new upstream"
+has "removed  .cursor/commands/adr.md" "upgrade: … and loses one removed upstream"
+has "merge    docs/new-doc.md" "upgrade: a file the project wrote where the new release adds one is listed to merge"
+[ "$(cat "$UP/docs/new-doc.md")" = "ours" ]; report $? "upgrade: … and left as the project wrote it"
+has "kept     docs/security.md" "upgrade: a file the project deleted, unchanged upstream, is kept"
+[ ! -e "$UP/docs/security.md" ]; report $? "upgrade: … deleted"
+has "kept     adapters/cursor/commands/new-cmd.md (its folder was removed in the project)" "upgrade: nothing is put back in a folder the project removed (L-3)"
+hasnt "merge    adapters/cursor/" "upgrade: … nor listed to merge"
+[ ! -d "$UP/adapters/cursor" ]; report $? "upgrade: … the folder stays removed"
+O="$UP/.git/anew-upgrade/upgrade-v9.1.out"
+[ -f "$O" ] && grep -q '^merge    docs/domain.md' "$O" && grep -q '^Upgrade v9.0 → v9.1' "$O"
+report $? "upgrade: the answer is kept in the git directory for /upgrade (H-1)"
+[ -z "$(ug status --porcelain | grep anew-upgrade)" ]; report $? "upgrade: … never in the working tree"
+run sh "$UN/scripts/upgrade" "$UB" "$UP"
+exits 1 "upgrade: refused on uncommitted changes";   has "has uncommitted changes" "… says so"
+# a project with a file of its own named like an adapter's, never installed (L-2); a CRLF checkout (L-8)
+U2="$TMP/up-project-2"; mkdir -p "$U2"
+sh "$UB/scripts/adopt" "$U2" >/dev/null
+grep -v 'STATUS: NOT CONFIGURED' "$U2/AGENTS.md" > "$TMP/agents" && cp "$TMP/agents" "$U2/AGENTS.md"
+printf 'our own notes\n' > "$U2/CLAUDE.md"; mkdir -p "$U2/.cursor/commands"; printf 'ours\n' > "$U2/.cursor/commands/own.md"
+sed 's/$/\r/' "$U2/docs/testing.md" > "$TMP/crlf" && cp "$TMP/crlf" "$U2/docs/testing.md"
+git -C "$U2" init -q; git -C "$U2" config core.autocrlf false; git -C "$U2" -c core.safecrlf=false add -A
+git -C "$U2" -c user.name=selftest -c user.email=selftest@example.invalid commit -qm own
+run sh "$UN/scripts/upgrade" "$UB" "$U2"
+exits 0 "upgrade: a project with no adapter installed"
+hasnt " CLAUDE.md" "upgrade: a file of the project's own is no adapter: not touched, not listed"
+hasnt " .claude/" "upgrade: … and no adapter is half-installed"
+[ "$(cat "$U2/CLAUDE.md")" = "our own notes" ]; report $? "upgrade: … CLAUDE.md as it was"
+has "skipped  .cursor/ (no ANEW cursor adapter found there: if it is installed, upgrade it by hand)" "upgrade: an adapter folder with none of ANEW's files is named, not upgraded (N-1)"
+[ "$(ls "$U2/.cursor/commands")" = "own.md" ]; report $? "upgrade: … and nothing is added to it"
+has "replaced docs/testing.md" "upgrade: a CRLF copy of an unchanged file is still unchanged"
+cmp -s "$U2/docs/testing.md" "$UN/docs/testing.md"; report $? "upgrade: … and gets the new release's bytes"
+mkdir -p "$TMP/up-fake/scripts"; cp "$UN/scripts/upgrade" "$TMP/up-fake/scripts/"
+run sh "$TMP/up-fake/scripts/upgrade" "$UB" "$U2"
+exits 1 "upgrade: a script outside a release";       has "run the new release's own scripts/upgrade" "… says so"
+cp -R "$U2" "$TMP/up-nogit"; rm -rf "$TMP/up-nogit/.git"
+run sh "$UN/scripts/upgrade" "$UB" "$TMP/up-nogit"
+exits 1 "upgrade: a project that is not a git repository"; has "is not a git repository" "… says so"
+rm "$TMP/up-nogit/.anew-version"
+run sh "$UN/scripts/upgrade" "$UB" "$TMP/up-nogit"
+exits 1 "upgrade: a project without .anew-version";  has "has no .anew-version" "… says so"
+ug add -A; ug commit -qm "chore: upgrade"
+run sh "$UN/scripts/upgrade" "$UB" "$UP"
+exits 0 "upgrade: a rerun after the commit"
+hasnt "replaced " "upgrade: … replaces nothing again"
+has "merge    docs/domain.md" "upgrade: … and the merge list is unchanged"
+run sh "$UN/scripts/upgrade" "$UB"
+exits 1 "upgrade: no project"
+mkdir -p "$TMP/up-notrel"; run sh "$UN/scripts/upgrade" "$TMP/up-notrel" "$UP"
+exits 1 "upgrade: a base that is not a release";     has "is not an unconfigured ANEW release" "… says so"
+printf 'v8.0\n' > "$UP/.anew-version"; ug commit -qam v8
+run sh "$UN/scripts/upgrade" "$UB" "$UP"
+exits 1 "upgrade: a base that is not the project's version"; has "fetch v8.0 as the base" "… says so"
+printf 'v9.1\n' > "$UP/.anew-version"; ug commit -qam v91
+run sh "$UN/scripts/upgrade" "$UN" "$UP"
+exits 1 "upgrade: already on the new release";       has "is already on v9.1" "… says so"
+printf 'v9.0\n' > "$UP/.anew-version"; printf '\n> **STATUS: NOT CONFIGURED.**\n' >> "$UP/AGENTS.md"; ug commit -qam template
+run sh "$UN/scripts/upgrade" "$UB" "$UP"
+exits 1 "upgrade: refused in a project not bootstrapped";  has "run /bootstrap first" "… says so"
+
+echo "== selftest: $passed passed, $failed failed =="
+[ "$failed" -eq 0 ] || exit 1
+exit 0

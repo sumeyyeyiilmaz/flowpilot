@@ -39,3 +39,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# ANEW
+Thumbs.db
+.idea/
+*.swp
+*.log
+!.env.example
+# Claude Code personal settings (shared settings.json IS committed after init)
+.claude/settings.local.json

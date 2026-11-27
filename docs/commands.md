@@ -1,0 +1,572 @@
+# Command reference
+
+Every ANEW command on one page: what it does, what it reads and writes, where it stops, and how
+lite and strict differ. This page is a map, not a second home for the rules — each entry points
+at the file that defines it. Segment rules live in `workflows/segments.md`; when the two
+disagree, that file wins and this page is out of date.
+
+## Command map
+
+```mermaid
+flowchart LR
+  I([INTENT]) --> A["/analyze<br/>ANALYZE"]
+  A --> G1{{"spec approval"}}
+  G1 --> P["/plan<br/>PLAN"]
+  P --> G2{{"plan approval"}}
+  G2 --> B["/build<br/>BUILD"]
+  B --> R["/review<br/>REVIEW"]
+  R --> G3{{"triage"}}
+  G3 -- "real findings: fix rounds" --> B
+  G3 --> V["/verify<br/>VERIFY"]
+  V --> G4{{"ship"}}
+  G4 --> S([SHIP])
+```
+
+The hexagons are the four human gates. `/new-feature` is the chainer: in lite it runs the whole
+row above, asking at each gate; in strict it refuses and each role runs its own segment command.
+
+Always available, outside the loop:
+
+| Group | Commands |
+|---|---|
+| Terminal scripts | `scripts/adopt` · `scripts/upgrade` · `scripts/init` · `scripts/doctor` · `scripts/status` · `scripts/gate` · `scripts/check` · `scripts/residue` · `scripts/selftest` |
+| Request lanes | `/change` (existing behavior) · `/fix-bug` (broken behavior) · `/refactor` (structure only) |
+| Setup · record · recover | `/bootstrap` · `/upgrade` · `/adr` · `/recover` |
+| Editor (optional) | the VS Code extension (`extensions/vscode/`) — a screen over `scripts/status`, `scripts/gate`, `scripts/init`, `scripts/adopt` and `scripts/upgrade` |
+
+## How to read this page
+
+Every command has the same fields:
+
+- **What it does** — one or two lines.
+- **When to use it** — the situation it is for.
+- **Reads / writes** — the files it uses. Context lives in files, so this is where to look.
+- **Stops at** — the gate, and the human decision it waits for.
+- **Lite / Strict** — the behavioral difference, or "no difference".
+- **Refusal** — the entry-check message, quoted verbatim from the source file, or "none".
+- **Common mistake** — one sentence.
+
+Mode is the `Mode:` line in `AGENTS.md`, set at bootstrap (`workflows/README.md`, Modes).
+
+## A — Terminal scripts
+
+### `scripts/adopt`
+- **What it does:** copies the ANEW core from a template copy into a project folder:
+  `AGENTS.md`, `.anew-version`, `docs/`, `workflows/`, `prompts/`, `scripts/`, `adapters/`,
+  `specs/` (templates, READMEs, `backlog.md`), `.gitattributes`, `.gitignore`,
+  `.github/workflows/check.yml`, `.github/pull_request_template.md`, and a three-line
+  `README.md` when the project has none. Never the template's own files (`.anew-dev/`,
+  `extensions/`, its README, `CHANGELOG.md`, `LICENSE`, `.claude/`).
+- **When to use it:** once, to bring ANEW into an existing project or an empty folder — run from a
+  clone of the release tag: `<template>/scripts/adopt <project>`. Then `scripts/init`, then
+  `/bootstrap`.
+- **Reads / writes:** reads the template it runs from — a clean clone of a release tag, since it
+  copies every file it finds in the folders; writes the core into the target. Files that exist
+  are kept and named (`kept   <path> (exists)`), never overwritten or merged; a kept `AGENTS.md`,
+  `.gitattributes` or `.gitignore` gets the template's beside it as `<name>.anew` and a
+  `merge  …` line — an `AGENTS.md` without ANEW's invariant rules fails doctor. No git call:
+  nothing is staged or committed; it prints the `git add --chmod=+x scripts/…` line that keeps
+  the scripts executable in a commit made on Windows.
+- **Stops at:** no gate; it prints what was written and kept, and the next step.
+- **Lite / Strict:** no difference — it runs before a mode exists.
+- **Refusal (exit 1):** no target, a target that is not a folder, the template itself, or a source
+  that is not an unconfigured template (a bootstrapped project is not a template).
+- **Common mistake:** expecting a kept file to be updated — `.gitignore`, README and any doc that
+  exists stay yours; compare them with the template by hand.
+
+### `scripts/upgrade`
+- **What it does:** the mechanical part of an upgrade. Each ANEW file of the project — the core
+  as `scripts/adopt` copies it, but `.anew-version`, plus each installed adapter's files where
+  `scripts/init` put them — is compared with the base release's copy and the new release's:
+  unchanged by the project → `replaced`, `added` or `removed`; changed by the project, left by
+  the new release → `kept`; changed by both → `merge`.
+- **When to use it:** on a branch `chore/anew-<tag>`, with clones of the project's base tag and
+  the new tag: `<new>/scripts/upgrade <base> <project>` — the new release's own copy. Then
+  `/upgrade` merges the `merge` files and writes `.anew-version` (`workflows/upgrade.md`; the
+  VS Code extension does the clones, the branch and this run).
+- **Reads / writes:** reads both releases and the project; writes the replaced, added and removed
+  files, and its answer to `.git/anew-upgrade/upgrade-<tag>.out` (where `/upgrade` reads the
+  `merge` list). Nothing is staged or committed; `.anew-version` is left as it is. An adapter
+  counts as installed when its files are ANEW's (a project's own `CLAUDE.md` is not one); a folder
+  the project removed gets nothing back; line endings are not a change.
+- **Stops at:** no gate; one line per file it did not find the same, a summary, and the
+  `git add --chmod=+x` line when it wrote a script.
+- **Lite / Strict:** no difference.
+- **Refusal (exit 1):** a project not bootstrapped, without `.anew-version`, on another version than
+  the base, already on the new one, not a git repository, or with uncommitted changes; a base or
+  a script that is not an unconfigured ANEW release.
+- **Common mistake:** running the project's own (older) copy — run the new release's.
+
+### `scripts/init`
+- **What it does:** installs one AI tool adapter into the repo root: `claude-code`,
+  `github-copilot`, `cursor`, `codex` or `generic`.
+- **When to use it:** once, before `/bootstrap`; again to add or refresh an adapter.
+- **Reads / writes:** reads `adapters/<tool>/`; writes `CLAUDE.md` + `.claude/`, or `.github/`
+  (`copilot-instructions.md`, `prompts/`, `agents/`, `instructions/`), or `.cursor/` (`rules/`,
+  `commands/`), or `.agents/skills/` (Codex). Existing files are kept unless `--force`; `generic`
+  writes nothing.
+- **Stops at:** no gate; it prints the next step (`Next: open Claude Code here and run /bootstrap`).
+- **Lite / Strict:** no difference — it runs before a mode exists.
+- **Refusal:** an unknown adapter prints `Unknown adapter: <name>` and the usage (exit 1).
+- **Common mistake:** `--force` over adapter files you customized — they are overwritten.
+
+### `scripts/doctor`
+- **What it does:** workspace health — required core files, recovery catalog, configuration
+  (`AGENTS.md`, mode, language, `scripts/check.conf`), the ANEW base version (`.anew-version`),
+  adapter presence and parity, this page's coverage, spec/plan gate consistency, twin and shipped specs, `specs/done/` immutability,
+  evidence hygiene, fast-only evidence, criterion-map names no file holds (WARN). `--strict` turns gate warnings into failures; CI runs it that way.
+  Step prerequisites (`requires` lines in `check.conf`): runs each distinct command once and
+  prints, per profile, `runnable on this machine` or `not runnable on this machine (steps: …)`
+  — a WARN in every mode, also under `--strict`: it describes the machine (R-13). A malformed
+  `requires` line (or one naming no step) is a WARN, and each profile then reads `check fails on
+  the check.conf errors above` — a conf error to fix, not an environment gap.
+  New ships (specs added to `specs/done/` vs the base ref; fail closed — a line with a checkbox
+  followed by an `AC-`/`CB-`/`PB-` id, only punctuation or emphasis between, is a criterion; its
+  first box decides; a box in backticks still counts): an unchecked criterion without
+  `→ moved to B-<n> | spec <NNNN>` (target existing), or any move in a sensitive-area spec, is a
+  gate (tick a proven criterion `[x]`); a spec target must be open (`specs/active/`). A
+  `Self-critique: pending` warns on a Draft — expected until the self-critique is approved — and
+  is a gate past approval. Locally the base is HEAD, so only an uncommitted ship is seen; CI on a
+  pull request sees every new ship.
+- **When to use it:** after bootstrap, before a PR, whenever the workspace feels off.
+- **Reads / writes:** reads the working tree (and git, for `specs/done/` against a base ref);
+  writes nothing itself; runs the project's prerequisite commands (side-effect free by contract).
+- **Stops at:** exit 0 = healthy (warnings allowed), exit 1 = broken; `FAIL` / `WARN` lines say why.
+- **Lite / Strict:** no difference. The `--strict` flag is not strict mode; the two are independent.
+- **Refusal:** none — it reports.
+- **Common mistake:** reading a local gate `WARN` (spec/plan consistency) as harmless — under
+  `--strict`, in CI, it is a `FAIL`.
+
+### `scripts/status`
+- **What it does:** where every piece of work stands — one row per spec in `specs/active/` and
+  `specs/done/` with its spec and plan status, the stage, who acts next and the next step, in the
+  words of `workflows/segments.md` (status follows that page: a change there changes status). The
+  stage comes from the files, in this order: spec `Draft` → ANALYZE (human); `Approved` without
+  plan → PLAN (Developer); plan without `Approved by / on` → PLAN (human); approved plan, spec not
+  started → BUILD; `In progress` without a `CHECK GREEN (full, …)` line in `## Build evidence` →
+  BUILD; with it and no triage table → REVIEW (a review writes no file: status says it cannot tell
+  whether it ran); the newest `### Review round` / `### VERIFY round` table (any case) with a
+  `real` finding whose Note cell names no fix → FIX ROUND. A finding is closed by its own Note: a
+  `fix-<k>` with a `[plan NNNN/fix-k]` commit anywhere in the history, or the sha of a commit
+  labeled `[plan NNNN/fix-…]` (a sha cited as background closes nothing); other words read as
+  open, and the order of the commits does not matter. Every real finding closed: one of them
+  Medium or higher (a `C-`/`H-`/`M-` id, or a severity word among the first two words of the
+  Finding cell) → REVIEW again on the fix diff; Low/Info only → VERIFY; a severity it cannot read
+  → unclear. A newest round holding an `investigate` verdict → `unclear: investigate open` (R-05:
+  QA investigates; a new round records the verdict), never VERIFY or SHIP. A review round without
+  real findings → VERIFY (a clean VERIFY writes no
+  table: same caveat); a VERIFY round without real findings → SHIP (human). Any other `###`
+  heading under `## Triage`, and anything else, is `unclear: <what is missing>`, never a stage.
+  Records are read outside HTML comments and fenced blocks — a template comment is not a record.
+  Two warnings per active row. **Evidence older than the code:** files outside `specs/` and
+  `.anew-dev/` changed after the last full line's `@<sha>`, committed or not (`docs/testing.md`,
+  rule 6), or `<sha>` is not a commit here. **Changed after approval:** the spec's Intent,
+  Requirements, User experience, Constraints and criterion texts, against the newest commit that
+  set a new `Approved by / on` value (a re-approval writes a new value — same day: add
+  `re-approved` — and clears the warning); the plan's Files, Ordered steps, Risks and Criterion ↔
+  test map, against the newer of that commit and the newest one that added an `A-<n>` line while
+  those sections were unchanged just before it (the `@<sha>` in the warning). Fenced blocks are
+  compared like any line (known limit: a four-backtick fence ends on an inner three-backtick
+  line). Status lines, ticked boxes, a criterion moved out per the template (a wrapped one too;
+  a strike without the `→ moved to` tail is a change), build evidence, triage and amendments are
+  not changes; a plan change with a new, uncommitted `A-<n>` line reads `amended (A-<n>)`. An
+  amendment covers neither a later nor an earlier unrecorded change: commit a plan edit together
+  with its `A-<n>` line (one committed after the edit does not cover it); otherwise the warning
+  stays until the plan is re-approved. A spec change is cleared by a new `Approved by / on`
+  value in the plan. A squash or rebase moves the approval
+  commit. Without git, or with an approval not
+  yet committed, the row says the check could not run — never clean.
+- **When to use it:** at the start of a session, after a gate, whenever you wonder whose turn it is.
+- **Reads / writes:** reads `specs/` and git; writes nothing (not `.anew-dev/`, and not
+  `.git/index`: git runs without optional locks).
+- **Stops at:** the rows, `WARN` and `note` lines; `no work yet — start with /new-feature or
+  /analyze` when there is no spec. Exit 0 whenever it could read the workspace, warnings included.
+  `--json` prints one document, stable within a minor version:
+  `{"anew_status":1,"rows":[{"spec","name","spec_status","plan_status","stage","who","next",
+  "warnings":[…],"notes":[…]}],"notes":[…]}` — all values strings (control characters as
+  `\u00XX`); a shipped row has stage
+  `shipped` and empty who, next and plan status.
+- **Lite / Strict:** no difference.
+- **Refusal:** an unknown argument prints `usage: scripts/status [--json]` (exit 2).
+- **Common mistake:** reading `REVIEW` or `VERIFY` as "it has not run" — a clean review,
+  re-review or VERIFY writes no table, so status cannot tell, and the row stays at REVIEW or
+  VERIFY until the next record. To move it on, record the clean round as its heading with no rows
+  (`### Review round 2 — <name>, <date> (clean)`); a clean review round reads VERIFY, a clean
+  VERIFY round reads SHIP.
+
+### `scripts/gate`
+- **What it does:** writes a human's decision in the form a hand edit takes, checks it first, and
+  commits it — one commit per decision, holding only the files it wrote (other staged changes
+  stay staged and out of it; uncommitted edits in a target file go in, and the output names
+  them: you approve the file as it is). The name is `git config user.name`, the date today.
+  - `approve-spec NNNN` (stage ANALYZE): the spec's `Status: Approved`.
+  - `approve-plan NNNN` (PLAN, human; the spec `Approved` or `In progress`): the plan's
+    `Status: Approved` and `Approved by / on: <name>, <date>` (the template's comment on that
+    line is dropped). On an approved plan it is a re-approval — the remedy for a
+    changed-after-approval warning: a new value, the same day with `(re-approved)`; a second one
+    the same day is refused.
+  - `triage NNNN --review|--verify [--finding "<text>" <verdict> "<note>"]…` (stage REVIEW, or
+    VERIFY; either at `unclear: investigate open`): appends `### Review round <n> — <name>,
+    <date>` (or `### VERIFY round <n>`) with its table at the end of `## Triage`; no finding
+    writes a clean round. Checked first: the verdict is real, noise, defer or investigate; noise
+    has a rationale; defer names a `B-<n>` that `specs/backlog.md` holds; no `|`, tab or line
+    break, no empty finding. A real finding's note names its fix later (`fix-<k>`, edited by
+    hand in the fix round).
+  - `ship NNNN` (stage SHIP, no status warning, the approval committed): ticks every criterion
+    as doctor reads a new ship — the first checkbox followed by an `AC-`/`CB-`/`PB-` id, any
+    bullet or section, so a mini spec too — unless it is moved out (a `→ moved to` / `-> moved
+    to` target after the id); ticks the Definition of Done, sets `Status: Shipped`, moves the
+    spec to `specs/done/` and points the plan's `Spec:` line there. A struck id without a target,
+    a move doctor would fail (a target that is not a `B-<n>` in the backlog or another spec in
+    `specs/active/`; any move in a sensitive-area spec), or a plan whose `Spec:` line does not
+    name the spec, refuses. The scorecard, the PR, the
+    merge and the tag stay with you.
+- **When to use it:** at a human gate, after reading the file it decides on — instead of the hand
+  edit, never on top of one. It records a human's decision: an agent never runs it on its own,
+  and nothing tells the two apart (`docs/roles/README.md`). Git identity is not a role check:
+  with agents every commit carries the human's name.
+- **Reads / writes:** reads `specs/`, git and `scripts/status --json`; writes the spec, the plan
+  (and the move to `specs/done/`), then commits.
+- **Stops at:** `<gate> NNNN: <what> — <file> @<sha>`; refusals name the stage found and the one
+  the gate decides.
+- **Lite / Strict:** no difference.
+- **Refusal:** exit 1 — the wrong stage, a status warning on ship, no git, an empty
+  `user.name`, no such spec or plan, a shipped spec; nothing is written. A failed commit (a hook,
+  signing) puts every file it wrote, the move and the index back, and says so (exit 1); so does
+  an interrupt before the commit (exit 130). An interrupt after the commit landed undoes nothing
+  and names the commit. A path it could not restore is named. Exit 2 — bad input or an unknown
+  argument, with the usage; nothing is written.
+- **Common mistake:** running it before reading the file. The commit is the record that you
+  decided; read the plan, the review report or the evidence table first.
+
+### `scripts/check`
+- **What it does:** the single verification contract — runs the steps in `scripts/check.conf` in
+  order, fail fast. `--fast` runs only the steps tagged `[fast]`. Before the first step it runs
+  the prerequisites (`requires <step>: <command>`) of the profile's steps, once per command.
+  **Fast green is a working state; only full green is evidence.** (`docs/testing.md`, Two speeds,
+  one contract)
+- **When to use it:** `--fast` while iterating, and before a push together with the touched
+  area's full-only tests (`docs/testing.md`, Two speeds, rule 8); plain `./scripts/check` at every
+  handoff, PROVE step, ramp exit and in CI. When CI runs full on the pushed commit, that run is
+  the handoff's full green (rule 6) — not a second local full run.
+- **Reads / writes:** reads `scripts/check.conf` (format: `scripts/check.conf.example`); writes
+  only what its steps write.
+- **Stops at:** `CHECK GREEN (full, n steps, t s)` (exit 0) or `CHECK FAILED (full) at step: <name>` (exit 1).
+- **Lite / Strict:** no difference.
+- **Refusal:** `check: no scripts/check.conf yet.` (exit 1); an unknown argument prints the
+  usage (exit 2); an unmet prerequisite: `CHECK FAILED (<profile>) prerequisite not met: <command>
+  (steps: …) — environment gap, …(R-13)` before any step (exit 1); a malformed `requires` line:
+  `CHECK FAILED (<profile>) requires names no step: <name>`, `… requires has no command: <step>`
+  or `… requires line has no ':': <line>` (exit 1).
+- **Common mistake:** citing `CHECK GREEN (fast, …)` as evidence.
+
+### `scripts/residue`
+- **What it does:** the residue test (`docs/testing.md`, Resource hygiene) — runs check twice and
+  names every process check left running, judged by its parent chain. What other sessions or the
+  OS started meanwhile is listed as `not from check` with its parent and never fails it. Memory
+  is reported, not judged (a drop over `ANEW_RESIDUE_MB` is marked informational). `--fast` tests
+  the fast profile.
+- **When to use it:** at bootstrap and whenever `scripts/check.conf` changes (BUILD's Done), both
+  profiles. The agent runs it; the gate shows one line, `Residue: clean (fast + full)`.
+- **Reads / writes:** runs `scripts/check`; writes only a temp dir, deleted on exit.
+- **Stops at:** `RESIDUE CLEAN (<profile>, 2 runs)` (exit 0) or `RESIDUE FOUND (<profile>)` (exit 1).
+  A `check.conf` without steps: `RESIDUE NOT MEASURED (<profile>)` (exit 0) — never evidence of clean.
+- **Lite / Strict:** no difference.
+- **Refusal:** a red check stops it: `RESIDUE TEST ABORTED (<profile>): check failed in run <n> — the residue test needs a green check`.
+- **Common mistake:** writing it into a spec as an acceptance criterion — it is BUILD's duty when
+  check.conf changes; or asking a human to idle the machine — attribution makes that unnecessary.
+
+### `scripts/selftest`
+- **What it does:** proves that `scripts/check`, `scripts/doctor`, `scripts/residue` and
+  `scripts/status` behave as documented, scenario by scenario.
+- **When to use it:** after changing any ANEW script; CI runs it after doctor.
+- **Reads / writes:** copies the ANEW core into a temp dir outside the repo; writes nothing in the repo.
+- **Stops at:** `== selftest: <n> passed, <m> failed ==` (exit 1 on any failure).
+- **Lite / Strict:** no difference.
+- **Refusal:** none.
+- **Common mistake:** editing a script and the selftest together to make it pass — a red selftest
+  means the script now differs from its documentation.
+
+## B — Start: `/bootstrap` and `/new-feature`
+
+### `/bootstrap`
+- **What it does:** adapts ANEW to your project through an interview — language, inspect,
+  interview, generate, verify, report (`workflows/bootstrap.md`). An empty tree takes the
+  greenfield flow; existing code takes the adoption flow (stack and conventions detected from the
+  code, confirmed rather than asked; flag changes proposed, never imposed).
+- **When to use it:** once per project, right after `scripts/init`; rerun to revise. Answers may
+  ride on the command — `/bootstrap chat=tr docs=en mode=lite trivial=1` (the VS Code extension's
+  Start screen builds it): each is your decision at its gate, confirmed in one line and not asked
+  again (`prompts/bootstrap.md`, "ANSWERS GIVEN WITH THE COMMAND").
+- **Reads / writes:** reads `AGENTS.md`, `prompts/bootstrap.md` and the working tree; writes
+  `docs/*.md`, `scripts/check.conf`, the `Mode` and `Language` lines and the project summary in
+  `AGENTS.md` (invariant rules kept verbatim).
+- **Stops at:** language · interview answers · the final report, where you approve the workspace.
+  The report ends with the first command for the mode.
+- **Lite / Strict:** it sets the mode; it runs the same in both.
+- **Refusal:** none.
+- **Common mistake:** skipping the VERIFY step's residue test — a bootstrap that fails it is not done.
+
+### `/new-feature`
+- **What it does:** the chainer, not a segment. Reads `Mode` from `AGENTS.md` first.
+  Rule: **Segments always stop; /new-feature flows only as far as the mode allows.**
+- **When to use it:** lite — every new feature starts here.
+- **Reads / writes:** `AGENTS.md`, `workflows/segments.md`; then whatever each segment reads and writes.
+- **Stops at:** spec approval · plan approval · triage · ship, continuing only on explicit approval.
+  A matching spec in `specs/active/` is resumed from its next gate, never twinned.
+  One-pass review: outside a sensitive area and with no criterion that needs the code broken on
+  purpose, a clean `/review` carries `/verify` in the same independent session; the gates stay
+  (`workflows/segments.md`, "The chainer").
+- **Lite / Strict:** lite chains `/analyze` → `/plan` → `/build` → `/review` → `/verify`;
+  strict refuses before any stage; unset stops (bootstrap has not run).
+- **Refusal (strict, in the chat language, command names verbatim):** "Mode is strict: stages are
+  role-owned. Analyst starts with /analyze; subsequent roles run /plan, /build, /review, /verify in
+  their own sessions."
+- **Common mistake:** expecting it to flow past a gate — it asks at every one, in every mode.
+
+## C — The five segment commands
+
+Each runs one segment of `workflows/segments.md`: entry check from files, work with its prompt,
+gate, handoff ending in `Next: <segment> — <who runs it>`, stop.
+
+### `/analyze`
+- **What it does:** intent → clarify → spec (with self-critique) → spec approval.
+- **When to use it:** strict — the Analyst starts a feature; lite — to resume at this gate.
+- **Reads / writes:** `prompts/clarify.md`, `prompts/spec.md`, `specs/active/`, `specs/done/`,
+  `specs/plans/` (for the next number); writes `specs/active/NNNN-<name>.md` and sets
+  `Status: Approved`.
+- **Stops at:** spec approval — "no open questions remain" · `Next: PLAN — Developer`.
+- **Lite / Strict:** lite folds clarify into the draft and the approval is a quick yes/no — never
+  skipped; strict clarifies first, then drafts. A sensitive area (`docs/domain.md`) clarifies
+  first in lite too.
+- **Refusal:** no fixed message — a matching spec in `specs/active/` is offered for resuming; a
+  second spec for the same work is never opened.
+- **Common mistake:** asking it for a plan — it never produces one.
+
+### `/plan`
+- **What it does:** a plan from the Approved spec, then plan approval recorded in the plan.
+- **When to use it:** after spec approval; again to revise a plan.
+- **Reads / writes:** reads `specs/active/NNNN-*.md`, `prompts/plan.md`; writes
+  `specs/plans/NNNN-plan.md` with `Approved by / on: <name>, <YYYY-MM-DD>`.
+- **Stops at:** plan approval · `Next: BUILD — Developer`. It writes no code.
+- **Lite / Strict:** no difference in checks or gate; in strict, the Developer runs it in a new session.
+- **Refusal:** "Spec not approved — run ANALYZE or get approval first."
+- **Common mistake:** approving in chat — only the filled `Approved by / on` line counts.
+
+### `/build`
+- **What it does:** implements the approved plan until `./scripts/check` is green.
+- **When to use it:** after plan approval; again to resume an `In progress` build, or for fix
+  rounds after triage (`prompts/build.md §fixes`).
+- **Reads / writes:** reads `specs/plans/NNNN-plan.md`, the spec, `prompts/build.md`; writes code
+  and tests and sets the spec to `Status: In progress`.
+- **Stops at:** changed files vs. the plan list (as amended) + real `./scripts/check` output ·
+  `Next: INDEPENDENT REVIEW — fresh session / read-only reviewer`. A deviation goes to R-07.
+- **Lite / Strict:** no difference in checks; in strict, a session of its own.
+- **Refusal:** "Plan not approved — run PLAN and get the approval recorded first."
+- **Common mistake:** reviewing its own build — the producer never verifies its own work.
+
+### `/review`
+- **What it does:** an independent, read-only review of the diff against the spec.
+- **When to use it:** after a build, and again on a fix diff with a Medium or higher finding
+  (in a sensitive area: every fix diff) — never on a fix diff that touches documentation only.
+- **Reads / writes:** reads the diff, the spec in `specs/active/`, its plan in `specs/plans/`
+  (file list, criterion ↔ test map), `prompts/review.md`; writes nothing.
+- **Stops at:** the findings report, verbatim · `Next: TRIAGE — human (real / noise / defer / investigate); then Developer fix rounds, then VERIFY`.
+  A clean one-pass review (lite, `workflows/segments.md`) also carries the evidence table ·
+  `Next: TRIAGE — human (confirm the clean verdict and the evidence table); then SHIP`.
+- **Lite / Strict:** no difference — independent review is never optional, in any mode: a
+  read-only reviewer (the `reviewer` subagent in Claude Code) or a fresh session.
+- **Refusal:** none — a soft check: without a branch/diff and a spec `In progress`, it says so and asks.
+- **Common mistake:** fixing findings in the same step — triage comes first, and it is the human's.
+
+### `/verify`
+- **What it does:** QA — maps every acceptance criterion to evidence (`docs/testing.md`,
+  Evidence policy).
+- **When to use it:** after triage is complete. Not needed after a clean one-pass review, whose
+  report already holds the table (lite, `workflows/segments.md`).
+- **Reads / writes:** reads the spec, the plan (criterion ↔ test map, `## Triage`), `prompts/verify.md`, test output; writes no production code.
+- **Stops at:** the criterion ↔ evidence table · `Next: SHIP — human (DoD, tick the proven criteria, move spec to specs/done/ with Status: Shipped in the PR, merge)`.
+- **Lite / Strict:** no difference; in strict, QA in a fresh session.
+- **Refusal:** none — a soft check: with no triage record in the plan's `## Triage`, it says so and asks.
+- **Common mistake:** a claim without evidence in the table — that is a gap, and gaps are findings.
+
+## D — Request lanes: `/change`, `/fix-bug`, `/refactor`
+
+### `/change`
+- **What it does:** changes a behavior that already exists. Triage first, three questions in
+  order (`workflows/change-request.md`): (a) deviation from what was agreed? → BUG;
+  (b) does an acceptance criterion change or appear? → CHANGE, else TRIVIAL;
+  (c) does it touch shared code? → CHANGE. Three lanes: BUG → `/fix-bug` · TRIVIAL → one narrow
+  commit per the `docs/git.md` "Trivial changes" policy · CHANGE → mini-spec from
+  `specs/TEMPLATE-mini.md` (`Source:` mandatory, changed + preserved criteria).
+- **When to use it:** any request to change existing behavior, however small it sounds.
+- **Reads / writes:** `workflows/change-request.md`, `docs/git.md`; writes a mini-spec in
+  `specs/active/` (CHANGE) or one commit (TRIVIAL).
+- **Stops at:** the triage verdict, which you confirm; then the lane's gates.
+- **Lite / Strict:** strict runs only ANALYZE (mini) and stops at `Next: PLAN — Developer runs /plan <NNNN>`;
+  lite chains the lane, asking at every gate — the plan gate is never skipped; a one-pass review
+  may join `/review` and `/verify` (`workflows/segments.md`, "The chainer").
+- **Refusal:** none — an open spec with the same `Source:` key is offered for resuming.
+- **Common mistake:** triaging by how small the request sounds instead of by the behavior test.
+
+### `/fix-bug`
+- **What it does:** the bug-fix workflow (`workflows/bug-fix.md`): report → red reproduction test →
+  diagnose → fix → prove → review → ship. No fix before a failing minimal reproduction test.
+- **When to use it:** the behavior deviates from what was agreed (triage question (a)).
+- **Reads / writes:** reads the report and `workflows/bug-fix.md`; writes the reproduction test
+  (permanent) and the fix.
+- **Stops at:** the reproduction (or a reasoned close) · triage of the fix review.
+- **Lite / Strict:** no difference — triage is a human gate in every mode.
+- **Refusal:** none — but no fix is written before the reproduction test is red.
+- **Common mistake:** a fix that changes behavior — that is the CHANGE lane, mini-spec first.
+
+### `/refactor`
+- **What it does:** structure changes, behavior provably unchanged (`workflows/refactor.md`). The
+  spec is a mini-spec: Changed behavior = *none — no observable behavior change*; Preserved
+  behavior = the characterization criteria.
+- **When to use it:** cleaning up structure without changing what the code does.
+- **Reads / writes:** `workflows/refactor.md`, `specs/TEMPLATE-mini.md`; writes
+  `specs/active/NNNN-refactor-<name>.md`, a plan, characterization tests (if missing), the refactor.
+- **Stops at:** approval of spec and plan · triage of the review.
+- **Lite / Strict:** no difference.
+- **Refusal:** none — but `./scripts/check` must be green before it starts.
+- **Common mistake:** editing a test — a needed test edit means behavior changed; stop.
+
+## E — Record, recover, upgrade: `/adr`, `/recover`, `/upgrade`
+
+### `/adr`
+- **What it does:** discusses an architecture decision, then records it from
+  `docs/decisions/TEMPLATE.md` (`docs/decisions/README.md`).
+- **When to use it:** a significant, hard-to-reverse choice — when it is made.
+- **Reads / writes:** `prompts/adr.md`; writes `docs/decisions/NNNN-<slug>.md`.
+- **Stops at:** your decision, before anything is written.
+- **Lite / Strict:** no difference.
+- **Refusal:** none.
+- **Common mistake:** changing an accepted ADR's decision in place — a new decision gets a new ADR.
+
+### `/recover`
+- **What it does:** picks the matching recovery ramp, says which and why, then runs its prompt.
+- **When to use it:** something went wrong — a red build, a drifting plan, a foggy context.
+- **Reads / writes:** `prompts/recovery/README.md` and the ramp's file; writes what that ramp allows.
+- **Stops at:** your confirmation of the ramp; then the ramp's own rules.
+- **Lite / Strict:** no difference.
+- **Refusal:** none — no match is treated as R-10 (ambiguity).
+- **Common mistake:** improvising a fix instead of naming the ramp.
+
+### `/upgrade`
+- **What it does:** finishes an upgrade to a newer ANEW release (`workflows/upgrade.md`): applies
+  each CHANGELOG entry above the base, oldest first, to the files `scripts/upgrade` listed
+  `merge` — behavior lists to extended scripts, intents to documents in the project's words —
+  takes new `ANEW-*` decisions, writes `.anew-version` last, one commit.
+- **When to use it:** after `scripts/upgrade` ran on `chore/anew-<tag>` with both releases under
+  `.git/anew-upgrade/` (the VS Code extension prepares all three): `/upgrade v1.32`.
+- **Reads / writes:** `prompts/upgrade.md`, both releases, the new CHANGELOG, the script's answer
+  in `.git/anew-upgrade/upgrade-<tag>.out`; writes the `merge`
+  files and `.anew-version`, commits on `chore/anew-<tag>`. Never pushes or merges.
+- **Stops at:** each question, with its recommendation; a change it cannot apply without guessing
+  (a recovery ramp).
+- **Lite / Strict:** no difference.
+- **Refusal:** not on `chore/anew-<tag>`.
+- **Common mistake:** copying a newer script over one the project extended — the behavior list is
+  applied instead.
+
+## F — Editor: the VS Code extension
+
+### The VS Code extension (`extensions/vscode/`)
+- **What it does:** the human's part of the process on a screen, over the template's scripts:
+  - **ANEW into a project** (a folder without ANEW): **Add ANEW to this project** — the latest
+    release cloned, its `scripts/adopt` run into the open folder (existing files kept, nothing
+    committed); **New ANEW project** — a new folder, `git init`, `scripts/adopt`, one commit
+    `chore: ANEW <tag>` with the scripts executable, opened; both after a confirmation naming the
+    folder and the version;
+  - the sidebar: **+ New work**, then the work as cards (your turn · in progress · shipped), each
+    naming the decision it waits for; a waiting badge and a status bar count — all from
+    `scripts/status --json`;
+  - **start new work:** the kind (`/new-feature`, `/change`, `/fix-bug`, `/refactor`; `/analyze`
+    for a feature in strict) and a description build the command, shown first; it opens a fresh
+    Claude Code session with it in a terminal, or you copy it to any agent, in the agent's form
+    (`$new-feature` for Codex). It writes no file;
+  - **setup** (on the start screen, and a sidebar card while something is missing): each adapter
+    installed or not, as `scripts/doctor` reads it; **Install** for a missing one, after a
+    confirmation naming the files → `./scripts/init <tool>` (never `--force`; existing files kept,
+    nothing committed);
+  - **bootstrap** (until `chore/bootstrap` is merged): the phases — not started · in the agent ·
+    generated · verified · merged — read from AGENTS.md and git; the chat and document languages,
+    the mode and the trivial-change policy answered on the screen and carried in `/bootstrap`;
+    **Run doctor** (read-only); **Push and open PR** of `chore/bootstrap` after a confirmation,
+    never the merge; merged on the remote but not pulled, it names the pull; **Start over** resets a
+    start that went nowhere;
+  - **upgrade** (a bootstrapped project, a newer release): the phases — available · in the agent ·
+    upgraded · verified · merged — read from `.anew-version` and git; on `v1.24.x` (no
+    `scripts/upgrade` on that line) the latest only as an explicit choice; **Fetch and prepare** after a confirmation (both
+    releases into `.git/anew-upgrade/`, `chore/anew-<tag>`, the new release's `scripts/upgrade`);
+    `/upgrade <tag>` with Copy and Continue; **Run checks** (doctor, then selftest); **Push and open
+    PR**, never the merge;
+  - **approve spec / plan** (ANALYZE, PLAN human): the file as cards; Approve after the full file
+    was opened → `scripts/gate approve-spec|approve-plan NNNN`;
+  - **triage** (REVIEW, VERIFY, an open investigate): paste the reviewer's report; it is split
+    into findings, each decided real · noise · defer · investigate (none chosen for you); a missed
+    finding is added by hand; the table is previewed → `scripts/gate triage NNNN --review|--verify`.
+    A defer's `specs/backlog.md` entry is appended first, shown in the preview, left uncommitted;
+  - **ship** (SHIP): criteria with their proof from the plan, the DoD, the evidence, the rounds →
+    `scripts/gate ship NNNN`; then **Push and open PR**, after a confirmation naming branch and
+    remote (`git push -u`, `gh pr create --fill`), or the two commands to copy. Never a merge;
+  - **the agent's next step** (a row at PLAN, BUILD, FIX ROUND, REVIEW or VERIFY, and after each
+    decision): the command that continues it (`/plan`, `/build`, `/review`, `/verify NNNN`, in
+    the agent's form) with Copy, and **Continue in Claude Code** under Start's rule — a fresh
+    session; the chat that asked for the decision is not told of it.
+- **When to use it:** when you follow the work in VS Code rather than the terminal.
+- **Reads / writes:** reads what `scripts/status` and the spec and plan files say; every decision
+  is one `scripts/gate` call, every install one `scripts/init` call; the only file it writes itself
+  is a defer's backlog entry. A pasted
+  report lives only in the open screen. No state of its own.
+- **Stops at:** Approve appears only after "Open the full file" has opened the file: the decision
+  is on the file, not the summary.
+- **Lite / Strict:** no difference (gate's own rules apply).
+- **Refusal:** gate's message, unchanged; without a POSIX shell (Git for Windows' `bash.exe`, or
+  the setting `anew.shell`) it reads and writes nothing and says so.
+- **Common mistake:** expecting it to drive the agent — it opens a session with your command and
+  shows the next step on every row that waits for the agent; the agent's segments and their stops are unchanged.
+
+## Recovery ramps
+
+Ramps are safe returns to the loop, not alternatives to it — each carries its own protection
+rules. The agent names the ramp's code and asks the human to run it; the catalog, R-01…R-13,
+lives in [`prompts/recovery/README.md`](../prompts/recovery/README.md).
+
+## Quick reference
+
+| Command | One line | Stops at | Lite | Strict |
+|---|---|---|---|---|
+| `scripts/adopt` | Bring the ANEW core into a project | Written / kept, next step | Same | Same |
+| `scripts/upgrade` | The unchanged ANEW files to a new release | Replaced / kept / merge, a summary | Same | Same |
+| `scripts/init` | Install an adapter | Prints next step | Same | Same |
+| `scripts/doctor` | Workspace health; `--strict` in CI | Exit 0 / 1 | Same | Same |
+| `scripts/check` | The verification contract; `--fast` to iterate | `CHECK GREEN` / `CHECK FAILED` | Same | Same |
+| `scripts/residue` | Check leaves nothing running | `RESIDUE CLEAN` / `RESIDUE FOUND` / `RESIDUE NOT MEASURED` | Same | Same |
+| `scripts/selftest` | ANEW's scripts behave as documented | Pass / fail count | Same | Same |
+| `/bootstrap` | Adapt ANEW to the project | Language · interview · report | Sets the mode | Sets the mode |
+| `/new-feature` | Chain the segments | Each of the four gates | Chains | Refuses |
+| `/analyze` | Intent → approved spec | Spec approval | Clarify folded into draft | Clarify first |
+| `/plan` | Approved spec → approved plan | Plan approval | Same | Own session |
+| `/build` | Approved plan → green check | Handoff with check output | Same | Own session |
+| `/review` | Independent, read-only review | Findings → triage | Same | Same |
+| `/verify` | Criteria ↔ evidence | Table → ship | Same | Own session |
+| `/change` | Triage, then the lane | Verdict; lane gates | Chains the lane | ANALYZE (mini) only |
+| `/fix-bug` | Red reproduction first | Repro · triage | Same | Same |
+| `/refactor` | Behavior unchanged, proven | Approval · triage | Same | Same |
+| `/adr` | Record a decision | Your decision | Same | Same |
+| `/recover` | Run the matching ramp | Ramp confirmation | Same | Same |
+| `/upgrade <tag>` | Merge a newer ANEW release into the project's changed files | Questions · a guess it cannot make | Same | Same |
+
+## Two golden rules
+
+1. **Segments always stop.** Every segment ends at its handoff; only `/new-feature` (lite) moves on,
+   and only after you approve.
+2. **The four human gates — spec approval, plan approval, triage, ship — are never automated, in
+   any mode.**
+
+The same commands exist in Claude Code, Cursor, GitHub Copilot and Codex (`./scripts/init <tool>`;
+in Codex they are skills, typed `$analyze` instead of `/analyze`); any other tool uses the generic
+adapter and pastes the prompts (`adapters/generic/README.md`). How strongly each rule holds per
+tool is the README's "How strongly is each rule held?" table.
